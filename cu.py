@@ -62,6 +62,8 @@ TTXC_HARVEST_WAIT_SECONDS = read_int_env(
     "UNICOM_TTXC_HARVEST_WAIT", default=3, minimum=0
 )
 MARKET_WAIT_MAX_SECONDS = read_int_env("UNICOM_MARKET_WAIT_MAX", default=300, minimum=0)
+MARKET_API_RETRIES = read_int_env("UNICOM_MARKET_API_RETRIES", default=3, minimum=1)
+MARKET_API_RETRY_BASE_SECONDS = 0.5
 TTXC_NEWBIE_STEPS = [
     "G01",
     "G02",
@@ -121,9 +123,11 @@ SHANGDU_LOTTERY_PRIZES = [
 SHANGDU_LOTTERY_FESTIVAL_PRIZES = ["30元话费券", *SHANGDU_LOTTERY_PRIZES]
 SHANGDU_LOTTERY_MAX = read_int_env("SHANGDU_LOTTERY_MAX", default=None, minimum=0)
 
-# 云手机积分 / 夏日刮一刮
+# 云手机积分 / 夏日刮一刮 / 打卡挑战赛
 UPHONE_H5API = "https://uphone.wostore.cn/h5api"
 UPHONE_WO_ADV = "https://uphone.wo-adv.cn"
+UPHONE_H5FORPHONE = "https://h5forphone.wostore.cn/h5forphone"
+UPHONE_CHECKIN_PAGE = "https://h5forphone.wostore.cn/changXiangVip/CLD13.html"
 UPHONE_CHANNEL = "ST-Wode"
 UPHONE_CHANNEL_H5 = "ST-Jingang002"
 UPHONE_EDOP_APP_ID = "edop_unicom_68e8fa69"
@@ -134,6 +138,10 @@ UPHONE_ACT_SUMMER = "HD2026062200218"
 UPHONE_GOODS_LOTTERY_10 = "2026031010"
 UPHONE_LOTTERY_COST = read_int_env("UNICOM_UPHONE_LOTTERY_COST", default=100, minimum=1)
 UPHONE_OBTAIN_SKIP = frozenset({"012-4", "TASK2026010601"})
+# 夏日刮一刮仅领此任务换抽奖次数，避免回退到 0514-001 等日限任务
+UPHONE_SUMMER_CLAIM_TASK = "2508-01"
+# 打卡挑战赛：需手填 QQ/微信 的奖品类型，跳过自动领取
+UPHONE_CHECKIN_SKIP_ACTIVITY_TYPES = frozenset({2, "2"})
 UPHONE_APP_UA = (
     "ChinaUnicom4.x/12.13 (com.chinaunicom.mobilebusiness; build:1; iOS 27.0.0) "
     "Alamofire/4.7.3 unicom{version:iphone_c@12.1300}"
@@ -246,6 +254,20 @@ def require_dict_data(r, action=None):
     if isinstance(data, dict):
         return data
     raise ValueError(api_response_err(r, action))
+
+
+def is_retryable_api_response(r) -> bool:
+    """网络超时、5xx、无 JSON 体等可重试；业务错误不重试。"""
+    if not r:
+        return True
+    code = r.get("code")
+    if code == -1:
+        return True
+    if isinstance(code, int) and code >= 500:
+        return True
+    if r.get("error") and not isinstance(r.get("data"), dict):
+        return True
+    return False
 
 
 def iter_set_cookies(headers: httpx.Headers | Mapping[str, object]):
@@ -479,14 +501,17 @@ class Unicom:
 
     # === 1. 首页签到 ===
     async def sign_get_task_ip(self):
+        """上报任务 IP；本地 orderId 始终可用。接口常返回非标准 JSON，失败不刷屏。"""
         order_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=32))
         r = await self.req(
             "POST",
             "https://m.client.10010.com/taskcallback/topstories/gettaskip",
             data={"mobile": self.mobile, "orderId": order_id},
         )
-        if r.get("code") == -1 or r.get("error"):
-            self.tlog(f"gettaskip网络/协议失败: {api_response_err(r, 'gettaskip')}")
+        # 协议/JSON 脏响应极常见且不影响 completeTask，静默；仅真实断网首次提示
+        if r.get("code") == -1 and not getattr(self, "_gettaskip_net_warned", False):
+            self._gettaskip_net_warned = True
+            self.tlog(f"gettaskip网络失败(后续忽略): {api_response_err(r, 'gettaskip')}")
         return order_id
 
     async def sign_get_continuous(self):
@@ -790,15 +815,37 @@ class Unicom:
         await asyncio.sleep(wait)
         return True
 
+    async def market_req_dict(self, action, method, url, **kw):
+        """权益超市请求：要求 data 为 dict；网络/5xx 短重试，失败软返回 None。"""
+        last_r = None
+        for attempt in range(MARKET_API_RETRIES):
+            r = await self.req(method, url, **kw)
+            last_r = r
+            data = r.get("data") if r else None
+            if isinstance(data, dict):
+                return data, r
+            err = api_response_err(r, action)
+            if attempt + 1 < MARKET_API_RETRIES and is_retryable_api_response(r):
+                self.tlog(
+                    f"优享权益: {action} 重试{attempt + 1}/{MARKET_API_RETRIES - 1} {err}"
+                )
+                await asyncio.sleep(MARKET_API_RETRY_BASE_SECONDS * (attempt + 1))
+                continue
+            return None, last_r
+        return None, last_r
+
     async def market_fetch_select_info(self):
         """对齐 HAR：premium 优享会员 vipType=0"""
-        r = await self.req(
+        res, r = await self.market_req_dict(
+            "selectInfo",
             "POST",
             "https://backward.bol.wo.cn/prod-api/market/contactVip/selectInfo/v2?vipType=0",
             headers=self.market_auth_headers(),
             json={},
         )
-        res = require_dict_data(r, "selectInfo")
+        if res is None:
+            self.tlog(f"优享权益: 会员状态查询失败 {api_response_err(r, 'selectInfo')}")
+            return None
         data = res.get("data")
         if res.get("code") != 200 or not data:
             self.tlog(f"优享权益: 会员状态查询失败 {api_response_err(r, 'selectInfo')}")
@@ -806,17 +853,24 @@ class Unicom:
         if isinstance(data, list):
             first = data[0]
             if not isinstance(first, dict):
-                raise ValueError(
-                    f"selectInfo data[0] 须为 dict，实际为 {type(first).__name__}"
+                self.tlog(
+                    f"优享权益: selectInfo data[0] 须为 dict，实际为 {type(first).__name__}"
                 )
+                return None
             info = first
         elif isinstance(data, dict):
             info = data
         else:
-            raise ValueError(
-                f"selectInfo data 须为非空 dict 或非空 list，实际为 {type(data).__name__}"
+            self.tlog(
+                f"优享权益: selectInfo data 须为非空 dict 或非空 list，实际为 {type(data).__name__}"
             )
-        if require_int(info.get("state"), "selectInfo.state") != 1:
+            return None
+        try:
+            state_ok = require_int(info.get("state"), "selectInfo.state") == 1
+        except ValueError as e:
+            self.tlog(f"优享权益: 会员状态字段异常 {e}")
+            return None
+        if not state_ok:
             self.tlog("优享权益: 非有效优享会员，跳过")
             return None
         self.market_cycle_start_time = str(info.get("cycleStartTime") or "")
@@ -831,13 +885,18 @@ class Unicom:
         }
         if self.market_cycle_start_time:
             payload["cycleStartTime"] = self.market_cycle_start_time
-        r = await self.req(
+        res, r = await self.market_req_dict(
+            "getActivitiesDetail/v2",
             "POST",
             "https://backward.bol.wo.cn/prod-api/promotion/activity/roll/getActivitiesDetail/v2",
             headers=self.market_auth_headers(),
             json=payload,
         )
-        res = require_dict_data(r, "getActivitiesDetail/v2")
+        if res is None:
+            self.tlog(
+                f"优享权益: 活动查询失败 {api_response_err(r, 'getActivitiesDetail/v2')}"
+            )
+            return None
         data = res.get("data")
         if res.get("code") != 200 or not data:
             self.tlog(
@@ -845,37 +904,69 @@ class Unicom:
             )
             return None
         if not isinstance(data, list):
-            raise ValueError(
-                f"getActivitiesDetail/v2 data 须为 list，实际为 {type(data).__name__}"
+            self.tlog(
+                f"优享权益: getActivitiesDetail/v2 data 须为 list，实际为 {type(data).__name__}"
             )
+            return None
         for act in data:
             if not isinstance(act, dict):
-                raise ValueError(
-                    f"getActivitiesDetail/v2 data 元素须为 dict，实际为 {type(act).__name__}"
+                self.tlog(
+                    f"优享权益: getActivitiesDetail/v2 data 元素须为 dict，实际为 {type(act).__name__}"
                 )
+                return None
             if act.get("activityCode") == "YOUCHOICEONE":
                 return act
         return data[0]
 
     def market_build_try_order(self, detail_list):
-        """优先当日惊喜[0]；本周期已领则按 n-1..1 倒序，跳过 status=3。"""
+        """优先当日惊喜[0]；其后按 n-1..1 倒序尝试基础权益，跳过 status=3。
+
+        惊喜售罄/拦截/失败时仍继续后面的基础商品，不再只试惊喜一项。
+        """
         detail_list = detail_list or []
         if not detail_list:
             return []
+        order = []
         first = detail_list[0]
         surprise = require_int(first.get("isSurprise"), "isSurprise") == 1
-        surprise_cycle_done = (
-            surprise and require_int(first.get("status"), "status") == 3
-        )
-        if surprise and not surprise_cycle_done:
-            return [first]
-        order = []
-        for idx in range(len(detail_list) - 1, 0, -1):
+        if surprise:
+            if require_int(first.get("status"), "status") != 3:
+                order.append(first)
+            for idx in range(len(detail_list) - 1, 0, -1):
+                item = detail_list[idx]
+                if require_int(item.get("status"), "status") == 3:
+                    continue
+                order.append(item)
+            return order
+        # 无惊喜位：整表倒序
+        for idx in range(len(detail_list) - 1, -1, -1):
             item = detail_list[idx]
             if require_int(item.get("status"), "status") == 3:
                 continue
             order.append(item)
         return order
+
+    @staticmethod
+    def market_should_try_next(msg: str) -> bool:
+        """领取失败文案是否应继续尝试下一商品。"""
+        if not msg:
+            return False
+        keywords = (
+            "已领取",
+            "已经抢过",
+            "本周",
+            "售罄",
+            "抢完",
+            "已抢空",
+            "抢光",
+            "库存不足",
+            "无库存",
+            "已领完",
+            "领完",
+            "明天十点",
+            "明日再来",
+        )
+        return any(k in msg for k in keywords)
 
     def market_item_blocked_reason(self, act, item):
         """对齐前端 handleReceiveRights 的拦截条件"""
@@ -919,7 +1010,8 @@ class Unicom:
             return False
         ts = int(time.time() * 1000)
         xbsosjl = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-        r = await self.req(
+        res, r = await self.market_req_dict(
+            "unlockSurprise",
             "POST",
             f"https://backward.bol.wo.cn/prod-api/promotion/activity/roll/unlock/surpriseInterest"
             f"?xbsosjl={xbsosjl}&timeVerRan={ts}&diceid={self.market_login_id}",
@@ -931,7 +1023,11 @@ class Unicom:
                 "activityId": first.get("activityId") or act.get("activityId"),
             },
         )
-        res = require_dict_data(r, "unlockSurprise")
+        if res is None:
+            self.tlog(
+                f"优享权益: 惊喜解锁失败 {api_response_err(r, 'unlockSurprise')}"
+            )
+            return False
         if res.get("code") == 200:
             self.tlog(f"优享权益: 惊喜解锁成功 {res.get('msg', '')}")
             await asyncio.sleep(1.5)
@@ -1029,6 +1125,9 @@ class Unicom:
 
             detail_list = act.get("detailList") or []
             items = self.market_build_try_order(detail_list)
+            if not items:
+                self.tlog("优享权益: 无可尝试商品")
+                return
             if detail_list:
                 first = detail_list[0]
                 if (
@@ -1037,45 +1136,82 @@ class Unicom:
                 ):
                     self.tlog("优享权益: 当日惊喜本周期已领，按倒序尝试基础权益")
                 elif require_int(first.get("isSurprise"), "isSurprise") == 1:
+                    base_n = max(0, len(items) - 1)
                     self.tlog(
                         f"优享权益: 优先尝试惊喜 [{first.get('productName', '')}]"
+                        f"，失败后可尝试 {base_n} 个基础权益"
                     )
+                else:
+                    self.tlog(f"优享权益: 按规则尝试 {len(items)} 个商品")
 
             need_surprise_unlock = (
                 require_int(act.get("isUnlock"), "isUnlock") != 1
                 and detail_list
                 and require_int(detail_list[0].get("isSurprise"), "isSurprise") == 1
             )
-            if need_surprise_unlock and not await self.market_unlock_surprise(act):
-                return
             if need_surprise_unlock:
+                unlocked = await self.market_unlock_surprise(act)
                 act = await self.market_fetch_youchoice_activity() or act
+                detail_list = act.get("detailList") or detail_list
+                items = self.market_build_try_order(detail_list)
+                if not unlocked:
+                    # 解锁失败：去掉惊喜项，只领基础权益
+                    first = detail_list[0] if detail_list else None
+                    if first and require_int(first.get("isSurprise"), "isSurprise") == 1:
+                        fid = first.get("id")
+                        items = [
+                            it
+                            for it in items
+                            if it is not first and it.get("id") != fid
+                        ]
+                    self.tlog("优享权益: 惊喜解锁失败，改为尝试基础权益")
+                if not items:
+                    self.tlog("优享权益: 无可尝试商品")
+                    return
 
-            for item in items:
+            for i, item in enumerate(items):
                 name = item.get("productName", "")
                 reason = self.market_item_blocked_reason(act, item)
                 if reason:
                     self.tlog(f"优享权益: [{name}] 跳过({reason})")
                     continue
 
-                res = await self.market_receive_rights(act, item)
+                try:
+                    res = await self.market_receive_rights(act, item)
+                except ValueError as e:
+                    self.tlog(f"优享权益: [{name}] 领取请求失败 {e}")
+                    continue
                 code = safe_int(res.get("code"), -1)
                 if code == 200:
                     self.tlog(f"优享权益: [{name}] 成功")
                     return
                 if code == -2:
                     self.tlog(f"优享权益: [{name}] 需人机验证，尝试 manMachine")
-                    if await self.market_man_machine(act.get("activityId")):
-                        res = await self.market_receive_rights(act, item)
-                        if safe_int(res.get("code")) == 200:
-                            self.tlog(f"优享权益: [{name}] 成功")
-                            return
-                    self.tlog(f"优享权益: [{name}] 人机验证后仍未成功")
+                    try:
+                        if await self.market_man_machine(act.get("activityId")):
+                            res = await self.market_receive_rights(act, item)
+                            if safe_int(res.get("code")) == 200:
+                                self.tlog(f"优享权益: [{name}] 成功")
+                                return
+                    except ValueError as e:
+                        self.tlog(f"优享权益: [{name}] 人机/重试失败 {e}")
+                    self.tlog(f"优享权益: [{name}] 人机验证后仍未成功，尝试下一商品")
                     continue
                 msg = str(res.get("msg", ""))
                 self.tlog(f"优享权益: [{name}] 失败 {msg or res}")
-                if "已领取" in msg or "已经抢过" in msg or "本周" in msg:
+                if self.market_should_try_next(msg):
+                    if i + 1 < len(items):
+                        nxt = items[i + 1].get("productName", "")
+                        self.tlog(f"优享权益: 按规则继续下一商品 [{nxt}]")
                     continue
+                # 明确不可再领（次数用尽等）时停止
+                if any(
+                    k in msg
+                    for k in ("今天已经抢过", "今日已领", "没有领取次数", "次数不足")
+                ):
+                    break
+            else:
+                self.tlog("优享权益: 已尝试全部可领商品，均未成功")
         except Exception as e:
             self.tlog_exc(e, "优享权益")
 
@@ -3761,7 +3897,7 @@ class Unicom:
 
         await self.battle_draw_lottery()
 
-    # === 云手机积分 / 夏日刮一刮 ===
+    # === 云手机积分 / 夏日刮一刮 / 打卡挑战赛 ===
     def uphone_biz_ok(self, data):
         """业务成功：data 必须为 dict 且 code 表示成功。"""
         if not isinstance(data, dict):
@@ -3801,6 +3937,33 @@ class Unicom:
         if extra:
             h.update(extra)
         return h
+
+    def uphone_checkin_headers(self):
+        """打卡挑战赛（h5forphone CLD13），复用 SSO cpToken。"""
+        token = self.uphone_cp_token or ""
+        return {
+            "User-Agent": UPHONE_H5_UA,
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Origin": "https://h5forphone.wostore.cn",
+            "Referer": f"{UPHONE_CHECKIN_PAGE}?token={token}",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    async def uphone_checkin_post(self, path, extra_json=None):
+        """POST h5forphone/activity/*，body 带 accesstoken=cpToken。"""
+        if not self.uphone_cp_token:
+            return None
+        payload = {"accesstoken": self.uphone_cp_token}
+        if extra_json:
+            payload.update(extra_json)
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5FORPHONE}/{path.lstrip('/')}",
+            headers=self.uphone_checkin_headers(),
+            json=payload,
+        )
+        return self.uphone_biz_data(r)
 
     async def uphone_sso_login(self):
         """ecs_token → ticket → cpToken"""
@@ -4071,29 +4234,38 @@ class Unicom:
         self.tlog(f"十连后余额={(summary or {}).get('balanceScoreNum')}")
 
     async def uphone_summer_claim_one(self):
-        """夏日刮一刮：仅领取 1 个可领任务的抽奖次数（优先 2508-01 去赚积分）"""
+        """夏日刮一刮：仅领 2508-01（去赚积分）换 1 次次数；无此可领任务则跳过。"""
         if not await self.uphone_activity_login(UPHONE_ACT_SUMMER):
             return 0
         tasks, left = await self.uphone_task_list(UPHONE_ACT_SUMMER)
-        unclaimed = [t for t in tasks if t.get("status") == "UNCLAIMED"]
-        if not unclaimed:
-            self.tlog(f"夏日无可领任务 rafflesLeft={left}")
+        pick = next(
+            (
+                t
+                for t in tasks
+                if str(t.get("taskCode") or "") == UPHONE_SUMMER_CLAIM_TASK
+                and t.get("status") == "UNCLAIMED"
+            ),
+            None,
+        )
+        if not pick:
+            self.tlog(
+                f"夏日 {UPHONE_SUMMER_CLAIM_TASK} 无可领 "
+                f"rafflesLeft={left}（已领过或未达条件，跳过）"
+            )
             return left
 
-        # 优先「去赚积分」，否则取列表第一个 UNCLAIMED
-        pick = next(
-            (t for t in unclaimed if str(t.get("taskCode")) == "2508-01"),
-            unclaimed[0],
-        )
-        code = str(pick.get("taskCode") or "")
+        code = UPHONE_SUMMER_CLAIM_TASK
         name = pick.get("taskName") or code
         ok, body = await self.uphone_raffle_get(UPHONE_ACT_SUMMER, code)
         if ok:
             self.tlog(f"夏日领次数成功 {code} {name}")
         else:
-            self.tlog(
-                f"夏日领次数失败 {code}: {(body or {}).get('msg') or body}"
-            )
+            msg = (body or {}).get("msg") if isinstance(body, dict) else body
+            biz = (body or {}).get("code") if isinstance(body, dict) else None
+            if biz in (10301, "10301"):
+                self.tlog(f"夏日领次数跳过(日限) {code}: {msg}")
+            else:
+                self.tlog(f"夏日领次数失败 {code}: {msg or body}")
         _, left2 = await self.uphone_task_list(UPHONE_ACT_SUMMER)
         self.tlog(f"夏日抽奖次数 rafflesLeft={left}→{left2}")
         return left2
@@ -4126,12 +4298,151 @@ class Unicom:
             self.tlog(f"夏日抽奖结束 draws={draws}")
         return draws
 
+    async def uphone_checkin_query(self):
+        """查询打卡挑战赛状态。"""
+        body = await self.uphone_checkin_post("activity/querySignInList")
+        if not body:
+            self.tlog("打卡查询无响应")
+            return None
+        if str(body.get("code")) == "50020":
+            self.tlog("打卡 token 失效(50020)")
+            return None
+        if not self.uphone_biz_ok(body):
+            self.tlog(f"打卡查询失败: {body.get('msg') or body}")
+            return None
+        return body
+
+    async def uphone_checkin_raffle(self, order_id, account="", account_type=""):
+        """打卡奖品核销 raffleSignIn（字段 activityOrderid 小写 id）。"""
+        if not order_id:
+            return False
+        body = await self.uphone_checkin_post(
+            "activity/raffleSignIn",
+            {
+                "activityOrderid": order_id,
+                "account": account or "",
+                "accountType": account_type or "",
+            },
+        )
+        if body and self.uphone_biz_ok(body):
+            redir = body.get("redirectUrl") or ""
+            self.tlog(
+                f"打卡领奖成功 order={order_id}"
+                + (f" redirect={redir[:80]}" if redir else "")
+            )
+            return True
+        self.tlog(
+            f"打卡领奖失败 order={order_id}: "
+            f"{(body or {}).get('msg') if isinstance(body, dict) else body}"
+        )
+        return False
+
+    async def uphone_checkin_handle_prize(self, body, source="签到"):
+        """处理签到/奖品中的 activityOrderId；type=2 需 QQ/微信则跳过。"""
+        if not isinstance(body, dict):
+            return
+        order_id = body.get("activityOrderId") or body.get("activityOrderid")
+        if not order_id:
+            return
+        act_type = body.get("activityType")
+        name = body.get("activityName") or body.get("name") or ""
+        if act_type in UPHONE_CHECKIN_SKIP_ACTIVITY_TYPES:
+            self.tlog(
+                f"打卡奖品需手填账号，跳过({source}) type={act_type} "
+                f"{name} order={order_id}"
+            )
+            return
+        self.tlog(f"打卡中奖({source}) {name or order_id} type={act_type}")
+        await self.uphone_checkin_raffle(order_id)
+        await asyncio.sleep(0.3)
+
+    async def uphone_checkin_claim_pending(self):
+        """我的奖品：自动领取可核销订单（跳过 type=2）。"""
+        body = await self.uphone_checkin_post("activity/signInRightList")
+        if not body or not self.uphone_biz_ok(body):
+            if body:
+                self.tlog(f"打卡奖品列表失败: {body.get('msg') or body}")
+            return
+        goods = body.get("goodsList") or []
+        if not isinstance(goods, list) or not goods:
+            self.tlog("打卡奖品列表为空")
+            return
+        claimed = 0
+        for g in goods:
+            if not isinstance(g, dict):
+                continue
+            state = g.get("state")
+            # 前端 award：state 1/2 可点；2 多为已发，失败则跳过
+            if state not in (1, 2, "1", "2"):
+                continue
+            act_type = g.get("activityType")
+            order_id = g.get("activityOrderId") or g.get("activityOrderid")
+            name = g.get("name") or ""
+            if not order_id:
+                continue
+            if act_type in UPHONE_CHECKIN_SKIP_ACTIVITY_TYPES:
+                self.tlog(f"打卡待领跳过(需账号) {name} type={act_type}")
+                continue
+            # state=2 历史已领过的不重复核销，仅补 state=1
+            if state not in (1, "1"):
+                continue
+            self.tlog(f"打卡补领 {name} order={order_id}")
+            if await self.uphone_checkin_raffle(order_id):
+                claimed += 1
+            await asyncio.sleep(0.3)
+        self.tlog(f"打卡奖品补领结束 claimed={claimed} total={len(goods)}")
+
+    async def uphone_checkin(self):
+        """打卡挑战赛 CLD13：query → signIn → 条件 raffle → 奖品补领。
+
+        复用 uphone_sso_login 的 cpToken，无需 activity-service 登录。
+        """
+        if not self.uphone_cp_token:
+            self.tlog("打卡跳过: 无 cpToken")
+            return
+
+        info = await self.uphone_checkin_query()
+        if info is None:
+            return
+        day = info.get("signDayNum")
+        left = info.get("surpriseDayNum")
+        self.tlog(f"打卡状态 已签{day}天 再签{left}天有惊喜")
+        if info.get("refreshFlag") == "refresh":
+            self.tlog("打卡完成一轮，开启新周期")
+
+        body = await self.uphone_checkin_post("activity/signIn")
+        if not body:
+            self.tlog("打卡签到无响应")
+            return
+        code = str(body.get("code", ""))
+        msg = body.get("msg") or ""
+        if code == "30038":
+            self.tlog(f"打卡今日已签: {msg or '今日已签过'}")
+        elif self.uphone_biz_ok(body):
+            self.tlog(f"打卡成功: {msg or 'ok'}")
+            await self.uphone_checkin_handle_prize(body, source="签到")
+            await asyncio.sleep(0.3)
+            info2 = await self.uphone_checkin_query()
+            if info2:
+                self.tlog(
+                    f"打卡后 已签{info2.get('signDayNum')}天 "
+                    f"再签{info2.get('surpriseDayNum')}天有惊喜"
+                )
+        else:
+            self.tlog(f"打卡失败[{code}]: {msg or body}")
+
+        await self.uphone_checkin_claim_pending()
+
     async def uphone_task(self):
-        """云手机：签到 → 积分任务 → 满额十连 → 夏日领1次次数并刮奖"""
+        """云手机：SSO → 打卡挑战赛 → 积分签到/任务/十连 → 夏日刮一刮"""
         self._task_tag = "云手机积分"
         self.tlog("开始")
         if not await self.uphone_sso_login():
             return
+
+        # 打卡挑战赛仅需 cpToken
+        await self.uphone_checkin()
+
         if not await self.uphone_activity_login(UPHONE_ACT_SIGN):
             return
 

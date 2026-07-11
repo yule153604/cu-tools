@@ -1,7 +1,12 @@
 .claude/
 .vscode/
 __pycache__/
-.har
+*.har
 token.md
-.log
+*.log
 login.py
+.env
+.env.*
+!.env.example
+*token*.json
+Cache.json

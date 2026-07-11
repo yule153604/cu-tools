@@ -31,15 +31,16 @@ cu.py
 | 商都福利 | `shangdu_task` | 按归属地跳过 |
 | 云手机积分 | `uphone_task` | 见下方说明 |
 
-### 云手机积分（`uphone_task`）
+### 云手机（`uphone_task`）
 
 在手厅 `ecs_token` 基础上换票进入云手机活动体系，顺序为：
 
-1. **SSO**：`getTicketByNative` → `getTokenByTicket` → 活动 `user/login`
-2. **积分签到**（`Points_Sign_2507`）
-3. **赚积分任务**（`Points_Obtain_2507`）：可 API 完成的任务自动上报并领取；讨论区、看广告等需真机行为的任务跳过
-4. **积分十连**：余额 ≥ 阈值且当日仍有次数时执行（默认满 100 分）
-5. **夏日刮一刮**（`HD2026062200218`）：每日只领取 **1 次**抽奖机会（优先「去赚积分」任务），有次数则抽完
+1. **SSO**：`getTicketByNative` → `getTokenByTicket` 得到 `cpToken`
+2. **打卡挑战赛**（CLD13 / `h5forphone`）：复用 `cpToken` 作 `accesstoken`；`querySignInList` → `signIn` → 有订单则 `raffleSignIn`；补领 `signInRightList` 中 `state=1` 奖品（需 QQ/微信的 type=2 跳过）
+3. **活动登录** + **积分签到**（`Points_Sign_2507`）
+4. **赚积分任务**（`Points_Obtain_2507`）：可 API 完成的任务自动上报并领取；讨论区、看广告等需真机行为的任务跳过
+5. **积分十连**：余额 ≥ 阈值且当日仍有次数时执行（默认满 100 分）
+6. **夏日刮一刮**（`HD2026062200218`）：仅领 `2508-01` 换 1 次次数，有次数则抽完
 
 ## 快速开始
 
