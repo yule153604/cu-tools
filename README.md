@@ -26,7 +26,6 @@ cu.py
 | 联通祝福 | `ltzf_task` | |
 | 安全管家 | `sec_task` | |
 | 通通乡村 | `farm_task` | |
-| 云盘乘风活动 | `cloudpan_task` | 需云盘 token |
 | 上传大比拼 | `cloud_battle_task` | 需云盘 token |
 | 商都福利 | `shangdu_task` | 按归属地跳过 |
 | 云手机积分 | `uphone_task` | 见下方说明 |
@@ -75,7 +74,6 @@ python cu.py
 | `UNICOM_TTXC_GARBAGE_WAIT` | `28` | 农场垃圾任务等待秒数 |
 | `UNICOM_TTXC_GROW_MAX_CHARGE_PER_LAND` | `20` | 单地块最大充能次数 |
 | `UNICOM_TTXC_HARVEST_WAIT` | `3` | 收获等待秒数 |
-| `UNICOM_YPHD_MGTV_IMG_FID` | 空 | 模板图片 fid |
 | `UNICOM_CLOUD_BATTLE_FILE` | `文本.txt` | 上传文件名 |
 | `UNICOM_CLOUD_BATTLE_CONTENT` | `1` | 上传文件内容 |
 | `SHANGDU_LOTTERY_MAX` | 剩余次数 | 单次最多抽奖次数 |

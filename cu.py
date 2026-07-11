@@ -77,20 +77,8 @@ TTXC_NEWBIE_STEPS = [
     "G12",
 ]
 
-YPHD_ACTIVITY_ID = "Mjg="
-YPHD_SECRET_KEY = "s8Hf3LqP9xN2vM5bR7tY1wZ4cA6eG0K"
-YPHD_MOVE_FILE_FID = (
-    "pNKsm_lDq4EJWsx1rFMP/uVX7f1Gbu4K4uDaFJepfssdrGui4u/poSDp/vKG21xEIiBk//"
-)
-YPHD_MOVE_FILE_NAME = "乘风2026精彩时刻-雨爱.mp4"
-YPHD_MGTV_BASE = "https://mgcact.api.mgtv.com"
-YPHD_MGTV_TEMPLATE_ID = "2053018128116371456"
-YPHD_MGTV_IMG_FID = os.environ.get("UNICOM_YPHD_MGTV_IMG_FID", "").strip()
-YPHD_MEMBER_SKU_CODE = "S251222T1F1M3702758"
-YPHD_MEMBER_ACTIVITY_CODE = "7IO6ren5HVMw3ouGRTepcSoFBM0r86ZGs9+Fjv6Xjv0="
-YPHD_MEMBER_TOUCHPOINT = "300300010005"
-YPHD_MEMBER_PHONE_KEY = "yEKmse436lnvTsle"
-YPHD_MEMBER_PHONE_IV = "wNSOYIB1k1DjY5lA"
+# 云盘活动签名密钥（上传大比拼等 panservice 活动共用）
+CLOUD_PAN_SIGN_SECRET = "s8Hf3LqP9xN2vM5bR7tY1wZ4cA6eG0K"
 
 CLOUD_BATTLE_ACTIVITY_ID = "MzA="
 CLOUD_BATTLE_TOUCHPOINT = "300200030001"
@@ -99,7 +87,7 @@ BATTLE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko)  unicom{version:iphone_c@12.1300};ltst;OSVersion/27.0"
 )
-CLOUD_BATTLE_FILEINFO_IV = YPHD_MEMBER_PHONE_IV
+CLOUD_BATTLE_FILEINFO_IV = "wNSOYIB1k1DjY5lA"
 CLOUD_BATTLE_FILE_NAME = os.environ.get("UNICOM_CLOUD_BATTLE_FILE", "文本.txt")
 CLOUD_BATTLE_FILE_CONTENT = os.environ.get("UNICOM_CLOUD_BATTLE_CONTENT", "1")
 
@@ -345,9 +333,6 @@ class Unicom:
 
     def tlog_exc(self, e, action=None):
         self.tlog(f"异常: {self.format_exc(e, action)}")
-
-    def yphd_log_exc(self, e, action=None):
-        self.yphd_log(f"异常: {self.format_exc(e, action)}")
 
     async def close(self):
         await self.client.aclose()
@@ -2935,580 +2920,22 @@ class Unicom:
 
         await self.shangdu_api("GET", "/monthlyRecharge/init")
 
-    # === 9. 云盘乘风活动===
-    def yphd_log(self, msg):
-        self.task_log("云盘乘风活动", msg)
-
-    def yphd_token(self):
+    def cloud_disk_token(self):
+        """联通云盘 userToken（上传大比拼等活动共用）。"""
         return (getattr(self, "cloud_disk", None) or {}).get("userToken", "")
 
-    def yphd_headers(self, client_id="1001000165", extra=None):
-        token = self.yphd_token()
-        if not token:
-            return {}
-        headers = {
-            "X-YP-Access-Token": token,
-            "User-Agent": "Mozilla/5.0 (Linux; Android 9; 23113RKC6C Build/PQ3A.190605.10201411; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36/woapp LianTongYunPan/5.5.0 (Android 9)",
-            "clientId": client_id,
-            "X-SH-Access-Token": "",
-            "X-YP-GRAY-FLAG": "undefined",
-            "Content-Type": "application/json",
-            "X-YP-Client-Id": client_id,
-            "token": token,
-            "Origin": "https://panservice.mail.wo.cn",
-            "Referer": f"https://panservice.mail.wo.cn/h5/activitymobile/aiActor?activityId=Mjg%3D&touchpoint=300300010005&token={token}",
-        }
-        if extra:
-            headers.update(extra)
-        return headers
-
-    async def yphd_post(self, path, payload=None, client_id="1001000165", extra=None):
-        headers = self.yphd_headers(client_id, extra)
-        if not headers:
-            return {}
-        r = await self.req(
-            "POST",
-            f"https://panservice.mail.wo.cn{path}",
-            headers=headers,
-            json=payload or {},
-        )
-        return require_dict_data(r, path)
-
-    async def yphd_get(self, path, params=None, client_id="1001000165", extra=None):
-        headers = self.yphd_headers(client_id, extra)
-        if not headers:
-            return {}
-        r = await self.req(
-            "GET",
-            f"https://panservice.mail.wo.cn{path}",
-            headers=headers,
-            params=params or {},
-        )
-        return require_dict_data(r, path)
-
-    def yphd_encrypt_phone(self, phone):
-        cipher = AES.new(
-            YPHD_MEMBER_PHONE_KEY.encode(), AES.MODE_CBC, YPHD_MEMBER_PHONE_IV.encode()
-        )
-        return base64.b64encode(
-            cipher.encrypt(pad(str(phone).encode(), AES.block_size))
-        ).decode()
-
-    def yphd_build_sign(self, payload):
+    def cloud_activity_sign(self, payload):
+        """panservice 活动请求签名。"""
         raw = (
             "&".join(f"{k}={payload[k]}" for k in sorted(payload))
-            + f"&secret={YPHD_SECRET_KEY}"
+            + f"&secret={CLOUD_PAN_SIGN_SECRET}"
         )
         return hmac.new(
-            YPHD_SECRET_KEY.encode(), raw.encode(), hashlib.sha256
+            CLOUD_PAN_SIGN_SECRET.encode(), raw.encode(), hashlib.sha256
         ).hexdigest()
 
-    async def yphd_signed_post(
-        self, path, key, payload=None, client_id="1001000165", extra=None
-    ):
-        ts = await self.yphd_post("/activity/getTimestamp", {"key": key})
-        result = ts.get("result") or {}
-        nonce = result.get("nonce")
-        timestamp = result.get("timestamp")
-        if not nonce or not timestamp:
-            self.yphd_log(f"getTimestamp失败 {response_summary(ts)}")
-            return {}
-        body = dict(payload or {})
-        body.update(
-            {"activityId": YPHD_ACTIVITY_ID, "nonce": nonce, "timestamp": timestamp}
-        )
-        body["sign"] = self.yphd_build_sign(body)
-        return await self.yphd_post(path, body, client_id, extra)
+    # === 9. 云盘上传大比拼===
 
-    async def yphd_member_claim(self):
-        phone = self.mobile
-        if not phone:
-            self.yphd_log("会员体验: 未识别手机号，跳过")
-            return False
-        token = self.yphd_token()
-        if not token:
-            return False
-        extra = {
-            "Referer": f"https://panservice.mail.wo.cn/h5/activitymobile/experienceMember?touchpoint={YPHD_MEMBER_TOUCHPOINT}&appName=yunpan&token={token}"
-        }
-        payload = {"phone": self.yphd_encrypt_phone(phone)}
-        check = await self.yphd_post(
-            "/activity/check/yp/members/eligibility", payload, "1001000001", extra
-        )
-        meta = check.get("meta") or {}
-        if str(meta.get("code")) != "200":
-            self.yphd_log(
-                f"会员体验: 资格查询失败 {meta.get('message') or response_summary(check)}"
-            )
-            return False
-        state = safe_int((check.get("result") or {}).get("state"), -1)
-        if state == 1:
-            self.yphd_log("会员体验: 已参与")
-            return True
-        if state != 0:
-            self.yphd_log(f"会员体验: 暂不可领取 state={state}")
-            return False
-        payload.update(
-            {
-                "skuCode": YPHD_MEMBER_SKU_CODE,
-                "activityCode": YPHD_MEMBER_ACTIVITY_CODE,
-                "channel": "6",
-                "touchpoint": YPHD_MEMBER_TOUCHPOINT,
-            }
-        )
-        data = await self.yphd_post(
-            "/activity/experience/yp/members", payload, "1001000001", extra
-        )
-        meta = data.get("meta") or {}
-        order_no = (data.get("result") or {}).get("orderNo")
-        self.yphd_log(
-            f"会员体验: 领取 {meta.get('message') or response_summary(data)}"
-            + (f" orderNo={order_no}" if order_no else "")
-        )
-        return str(meta.get("code")) == "200"
-
-    async def yphd_move_file(self):
-        payload = {
-            "activityId": YPHD_ACTIVITY_ID,
-            "fids": [YPHD_MOVE_FILE_FID],
-            "taskType": 10,
-            "fileType": 2,
-            "fileName": YPHD_MOVE_FILE_NAME,
-            "directoryId": 0,
-            "additionalParams": {"aiHeaderSubType": 0},
-        }
-        extra = {
-            "Access-Token": self.yphd_token(),
-            "Client-Id": "1001000165",
-            "App-Version": "yp-app/5.5.0",
-            "Referer": f"https://panservice.mail.wo.cn/h5/activitymobile/aiActor?activityId=Mjg%3D&touchpoint=300300010065&token={self.yphd_token()}",
-        }
-        res = await self.yphd_post(
-            "/wohome/open/v1/ai/moveFile2Person", payload, "1001000165", extra
-        )
-        self.yphd_log(
-            f"视频转存 {res.get('meta', {}).get('message') or response_summary(res)}"
-        )
-        return res
-
-    async def yphd_ai_query(self):
-        payload = {
-            "input": "你好",
-            "modelId": 0,
-            "platform": 2,
-            "tag": 21,
-            "conversationId": "",
-            "knowledgeId": "",
-            "referFileInfo": [],
-            "messageId": "",
-            "conversationType": 0,
-            "recipient": "",
-            "async": False,
-        }
-        headers = self.yphd_headers(
-            "1001000035",
-            {
-                "accept": "text/event-stream",
-                "X-YP-App-Version": "5.4.2",
-                "Referer": f"https://panservice.mail.wo.cn/h5/wocloud_ai_1/workFlow?needBackBtn=true&token={self.yphd_token()}",
-            },
-        )
-        if not headers:
-            return ""
-        try:
-            text = ""
-            async with self.client.stream(
-                "POST",
-                "https://panservice.mail.wo.cn/wohome/ai/assistant/query",
-                json=payload,
-                headers=headers,
-                timeout=30,
-            ) as res:
-                if res.status_code != 200:
-                    self.yphd_log(f"AI助手失败 {res.status_code}")
-                    return ""
-                async for line in res.aiter_lines():
-                    if line:
-                        text += line
-                    if len(text) > 500:
-                        break
-            self.yphd_log("AI助手响应完成")
-            return text
-        except Exception as e:
-            self.yphd_log_exc(e, "AI助手")
-            return ""
-
-    def yphd_mgtv_headers(self):
-        return {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 9; 23113RKC6C Build/PQ3A.190605.10201411; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36/woapp LianTongYunPan/5.5.0 (Android 9)",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Origin": "https://pop.mgtv.com",
-            "Referer": "https://pop.mgtv.com/",
-        }
-
-    async def yphd_mgtv_login(self):
-        data = await self.yphd_post("/api-user/api/user/ticket", {}, "1001000035")
-        ticket = (data.get("result") or {}).get("ticket")
-        if not ticket:
-            self.yphd_log(f"芒果ticket失败 {response_summary(data)}")
-            return "", ""
-        r = await self.req(
-            "GET",
-            f"{YPHD_MGTV_BASE}/api/cu/login",
-            params={"ticket": ticket, "t": int(time.time() * 1000)},
-            headers=self.yphd_mgtv_headers(),
-        )
-        self.yphd_log(
-            "芒果登录成功" if r.get("code") == 200 else f"芒果登录失败 {r.get('code')}"
-        )
-        info = r["data"].get("data", {}) if isinstance(r.get("data"), dict) else {}
-        if not isinstance(info, dict):
-            info = {}
-        mgtv_ticket = info.get("ticket") or ticket
-        access_token = info.get("accessToken", "")
-        await self.req(
-            "GET",
-            f"{YPHD_MGTV_BASE}/api/cu/popup/check",
-            params={"ticket": mgtv_ticket},
-            headers=self.yphd_mgtv_headers(),
-        )
-        return mgtv_ticket, access_token
-
-    async def yphd_mgtv_image_candidates(self):
-        candidates = []
-        seen = set()
-
-        def add_candidate(value, name):
-            value = str(value or "").strip()
-            if value and value not in seen:
-                seen.add(value)
-                candidates.append((value, name))
-                return True
-            return False
-
-        if YPHD_MGTV_IMG_FID:
-            add_candidate(YPHD_MGTV_IMG_FID, "环境图片")
-        works_payload = {"pageSize": 20, "pageNo": 1, "type": 0}
-        works_extra = {
-            "Referer": f"https://panservice.mail.wo.cn/h5/mobile/aiProduct?token={self.yphd_token()}"
-        }
-        works = await self.yphd_post(
-            "/wohome/open/v1/ai/getNewYearWorksList",
-            works_payload,
-            "1001000003",
-            works_extra,
-        )
-        for item in (works.get("result") or {}).get("result") or []:
-            if safe_int(item.get("status")) == 1 and safe_int(item.get("type")) == 5:
-                fid = parse_qs(
-                    urlparse(str(item.get("uploadPictureUrl") or "")).query
-                ).get("fid", [""])[0]
-                add_candidate(fid, f"历史作品{item.get('id') or ''}人脸图")
-        payload = {
-            "pageSize": 20,
-            "pageNo": 1,
-            "suffixList": ["jpg", "jpeg", "png"],
-            "fileType": "1",
-            "spaceType": 0,
-            "sortRule": "0",
-        }
-        extra = {
-            "Referer": f"https://panservice.mail.wo.cn/h5/mobile/mgtv?type=1&token={self.yphd_token()}"
-        }
-        for client_id in ("1001000003", "1001000172"):
-            data = await self.yphd_post(
-                "/wohome/knowledge/queryTypeFileList", payload, client_id, extra
-            )
-            for item in (data.get("result") or {}).get("details") or []:
-                fid = str(item.get("fid") or "").strip()
-                if (
-                    fid
-                    and fid not in seen
-                    and safe_int(item.get("fileSize"), 0) <= 10 * 1024 * 1024
-                ):
-                    seen.add(fid)
-                    candidates.append((fid, item.get("fileName") or fid[:12]))
-        if not candidates:
-            self.yphd_log("未找到可用图片，请上传一张清晰单人正脸图片到联通云盘后重试")
-        return candidates
-
-    async def yphd_task2_query(self):
-        extra = {
-            "Accept": "application/json, text/plain, */*",
-            "source-type": "woapi",
-            "requestTime": str(int(time.time() * 1000)),
-            "X-Requested-With": "com.chinaunicom.bol.cloudapp",
-            "X-YP-Client-Id": "1001000035",
-            "Referer": f"https://panservice.mail.wo.cn/h5/activitymobile/aiActor/main1?activityId=Mjg%3D&touchpoint=300300010005&token={self.yphd_token()}",
-        }
-        return await self.yphd_signed_post(
-            "/activity/aiRole/task2/query",
-            "activity:query:task2",
-            {},
-            "1001000165",
-            extra,
-        )
-
-    async def yphd_task2_acquire(self):
-        return await self.yphd_signed_post(
-            "/activity/aiRole/task2",
-            "activity:acquire:task2",
-            {},
-            "1001000165",
-            {
-                "X-YP-Open-Version": "v1.0",
-                "X-CM-SERVICE": self.mobile,
-                "X-PATH": "/h5/wocloud_ai_1/workFlow",
-                "accesstoken": self.yphd_token(),
-                "Access-Token": self.yphd_token(),
-                "App-Version": "yp-app/5.5.0",
-                "Client-Id": "1001000165",
-            },
-        )
-
-    def yphd_lottery_headers(self):
-        return {
-            "Accept": "application/json, text/plain, */*",
-            "source-type": "woapi",
-            "requestTime": str(int(time.time() * 1000)),
-            "X-Requested-With": "com.chinaunicom.bol.cloudapp",
-            "X-YP-Client-Id": "1001000035",
-            "Referer": f"https://panservice.mail.wo.cn/h5/activitymobile/aiActor/main1?activityId=Mjg%3D&touchpoint=300300010005&token={self.yphd_token()}",
-        }
-
-    async def yphd_lottery_remaining(self):
-        times = await self.yphd_get(
-            "/activity/lottery/lottery-times",
-            {"activityId": YPHD_ACTIVITY_ID},
-            "1001000035",
-            self.yphd_lottery_headers(),
-        )
-        if str((times.get("meta") or {}).get("code")) != "200":
-            return 0, times
-        times_result = times.get("result")
-        if isinstance(times_result, dict):
-            remaining = (
-                times_result.get("remainCount")
-                or times_result.get("remaining")
-                or times_result.get("lotteryTimes")
-                or times_result.get("times")
-                or times_result.get("count")
-                or 0
-            )
-        else:
-            remaining = times_result or 0
-        return int(remaining or 0), times
-
-    async def yphd_do_lotteries(self):
-        remaining, _ = await self.yphd_lottery_remaining()
-        self.yphd_log(f"抽奖次数 {remaining}")
-        if remaining <= 0:
-            return 0
-        drawn = 0
-        while remaining > 0:
-            prize = await self.yphd_signed_post(
-                "/activity/lottery",
-                "activity:lottery",
-                {},
-                "1001000035",
-                self.yphd_lottery_headers(),
-            )
-            meta = prize.get("meta") or {}
-            if str(meta.get("code")) != "200":
-                self.yphd_log(
-                    f"第{drawn + 1}次抽奖失败 {meta.get('message') or response_summary(prize)}"
-                )
-                break
-            info = prize.get("result") or {}
-            drawn += 1
-            prize_name = info.get("prizeName") or response_summary(prize)
-            self.yphd_log(f"第{drawn}次抽奖成功 {prize_name}")
-            await asyncio.sleep(2)
-            remaining, _ = await self.yphd_lottery_remaining()
-            if remaining > 0:
-                self.yphd_log(f"剩余抽奖次数 {remaining}")
-        if drawn:
-            await self.yphd_signed_post(
-                "/activity/fragment/updateFrontendStatus",
-                "activity:fragment:frontendStatus",
-                {"frontendStatus": 1},
-                "1001000035",
-            )
-        return drawn
-
-    async def yphd_mgtv_template_submit(self, payload):
-        r = await self.req(
-            "POST",
-            f"{YPHD_MGTV_BASE}/api/cu/video/template/submit",
-            headers=self.yphd_mgtv_headers(),
-            json=payload,
-        )
-        if isinstance(r.get("data"), dict):
-            return r["data"]
-        return {"msg": str(r.get("data", ""))[:120] or f"HTTP {r.get('code')}"}
-
-    async def yphd_mgtv_task(self, ticket, access_token):
-        image_candidates = await self.yphd_mgtv_image_candidates()
-        if not image_candidates:
-            return False
-        for image_fid, image_name in image_candidates:
-            self.yphd_log(f"选用图片 {image_name}")
-            payload = {
-                "ticket": ticket,
-                "templateId": YPHD_MGTV_TEMPLATE_ID,
-                "index": 0,
-                "imgUrl": image_fid,
-            }
-            data = await self.yphd_mgtv_template_submit(payload)
-            for retry in range(3):
-                if data.get("msg") != "权益扣减失败":
-                    break
-                off = await self.req(
-                    "GET",
-                    f"{YPHD_MGTV_BASE}/api/cu/offlineSubscribe",
-                    params={"ticket": ticket},
-                    headers=self.yphd_mgtv_headers(),
-                )
-                off_data = off["data"] if isinstance(off.get("data"), dict) else {}
-                try:
-                    off_msg = (
-                        off_data.get("msg")
-                        or off_data.get("message")
-                        or response_summary(off_data)
-                    )
-                    success = (off_data.get("data") or {}).get("success")
-                    if success is not None:
-                        off_msg = f"{off_msg} success={success}"
-                except Exception:
-                    off_msg = str(off.get("data", ""))[:80] or f"HTTP {off.get('code')}"
-                self.yphd_log(f"订阅权益 {off_msg}")
-                await asyncio.sleep(8 + retry * 6)
-                data = await self.yphd_mgtv_template_submit(payload)
-            raw_result = data.get("data")
-            result = raw_result if isinstance(raw_result, dict) else {}
-            task_id = result.get("taskId") or data.get("taskId")
-            if not task_id:
-                msg = data.get("msg") or response_summary(data)
-                self.yphd_log(f"模板提交失败 {msg}")
-                if "照片" in msg or "人脸" in msg:
-                    continue
-                return False
-            for _ in range(20):
-                result_r = await self.req(
-                    "GET",
-                    f"{YPHD_MGTV_BASE}/api/cu/video/template/result",
-                    params={"taskId": task_id, "ticket": ticket},
-                    headers=self.yphd_mgtv_headers(),
-                )
-                result_data = (
-                    result_r["data"] if isinstance(result_r.get("data"), dict) else {}
-                )
-                try:
-                    raw_info = result_data.get("data")
-                    info = raw_info if isinstance(raw_info, dict) else {}
-                    audit_state = safe_int(info.get("auditState"))
-                    algorithm_state = safe_int(info.get("algorithmState"))
-                    if result_data.get("errno") == "0" and (
-                        audit_state == 2 or audit_state > 1 and algorithm_state > 1
-                    ):
-                        self.yphd_log(f"模板生成成功 taskId={task_id}")
-                        return True
-                except Exception:
-                    self.yphd_log(f"模板结果 {str(result_r.get('data', ''))[:120]}")
-                    return False
-                await asyncio.sleep(3)
-            self.yphd_log(f"模板仍在生成 taskId={task_id}")
-            return False
-        self.yphd_log("没有可通过识别的图片")
-        return False
-
-    async def cloudpan_task(self):
-        """云盘乘风活动主任务"""
-        if not self.yphd_token():
-            return
-        self._task_tag = "云盘乘风活动"
-        await self.yphd_member_claim()
-        self.yphd_log("开始")
-        status = await self.yphd_signed_post(
-            "/activity/fragment/status",
-            "activity:fragment:status",
-            {},
-            "1001000035",
-        )
-        result = status.get("result") or {}
-        self.yphd_log(f"碎片阶段 {result.get('fragmentStep')}")
-        task_info = await self.yphd_get(
-            "/activity/activity/task/info",
-            {"activityId": YPHD_ACTIVITY_ID},
-            "1001000035",
-        )
-        logs = (task_info.get("result") or {}).get("logs") or []
-        if logs:
-            self.yphd_log(
-                "已完成 "
-                + "、".join(x.get("taskName", "") for x in logs if x.get("taskName"))
-            )
-        await self.yphd_signed_post(
-            "/activity/fragment/task/activate", "activity:fragment:activate"
-        )
-        await self.yphd_move_file()
-        await self.yphd_ai_query()
-        task1 = await self.yphd_signed_post(
-            "/activity/aiRole/task1/acquire",
-            "activity:acquire:task1",
-            {},
-            "1001000035",
-        )
-        self.yphd_log(
-            f"task1 {task1.get('meta', {}).get('message') or response_summary(task1)}"
-        )
-        status_after = await self.yphd_signed_post(
-            "/activity/fragment/status",
-            "activity:fragment:status",
-            {},
-            "1001000035",
-        )
-        step_after = safe_int((status_after.get("result") or {}).get("fragmentStep"))
-        self.yphd_log(f"task1后碎片阶段 {step_after}")
-        if step_after >= 3:
-            self.yphd_log("已有作品仅作素材，继续今日制作")
-        else:
-            self.yphd_log("task2等待作品制作")
-        ticket, access_token = await self.yphd_mgtv_login()
-        mgtv_ok = False
-        if ticket:
-            mgtv_ok = await self.yphd_mgtv_task(ticket, access_token)
-        if mgtv_ok:
-            status_after = await self.yphd_signed_post(
-                "/activity/fragment/status",
-                "activity:fragment:status",
-                {},
-                "1001000035",
-            )
-            step_after = safe_int(
-                (status_after.get("result") or {}).get("fragmentStep")
-            )
-            self.yphd_log(f"作品后碎片阶段 {step_after}")
-            query = await self.yphd_task2_query()
-            self.yphd_log(
-                f"模板后task2确认 {query.get('meta', {}).get('message') or response_summary(query)}"
-            )
-            if safe_int(query.get("result")) != 1:
-                task2 = await self.yphd_task2_acquire()
-                self.yphd_log(
-                    f"模板后task2 {task2.get('meta', {}).get('message') or response_summary(task2)}"
-                )
-        records = await self.yphd_post(
-            "/activity/aiRole/userDrawRecords",
-            {"activityId": YPHD_ACTIVITY_ID},
-            "1001000035",
-        )
-        if records.get("result"):
-            self.yphd_log(f"抽奖记录 {len(records.get('result') or [])} 条")
-        await self.yphd_do_lotteries()
-
-    # === 10. 云盘上传大比拼===
     def battle_log(self, msg):
         self.task_log("上传大比拼", msg)
 
@@ -3518,7 +2945,7 @@ class Unicom:
     def battle_referer(self):
         if self.battle_page_referer:
             return self.battle_page_referer
-        token = self.yphd_token()
+        token = self.cloud_disk_token()
         return (
             f"https://panservice.mail.wo.cn/h5/activitymobile/cloudBattle"
             f"?activityId={quote(CLOUD_BATTLE_ACTIVITY_ID)}&touchpoint={CLOUD_BATTLE_TOUCHPOINT}&token={token}"
@@ -3526,7 +2953,7 @@ class Unicom:
 
     async def battle_enter(self):
         """进入活动页，刷新 token 并获取带 ticket 的 Referer（lottery-times 必需）"""
-        token = self.yphd_token()
+        token = self.cloud_disk_token()
         if not token:
             return False
         entry = (
@@ -3561,7 +2988,7 @@ class Unicom:
         return False
 
     def battle_headers(self, client_id="1001000003", extra=None):
-        token = self.yphd_token()
+        token = self.cloud_disk_token()
         if not token:
             return {}
         headers = {
@@ -3636,7 +3063,7 @@ class Unicom:
                 "timestamp": timestamp,
             }
         )
-        body["sign"] = self.yphd_build_sign(body)
+        body["sign"] = self.cloud_activity_sign(body)
         return await self.battle_post(path, body, client_id, extra)
 
     async def battle_check_opened(self):
@@ -3715,7 +3142,7 @@ class Unicom:
         return False
 
     async def battle_upload_file(self):
-        token = self.yphd_token()
+        token = self.cloud_disk_token()
         if not token:
             return False
         content = CLOUD_BATTLE_FILE_CONTENT.encode("utf-8")
@@ -3820,7 +3247,7 @@ class Unicom:
 
     async def cloud_battle_task(self):
         """上传大比拼：进入活动 -> 开启冲榜 -> 上传文件 -> 抽奖"""
-        if not self.yphd_token():
+        if not self.cloud_disk_token():
             return
         self._task_tag = "上传大比拼"
         self.battle_log("开始")
@@ -4466,7 +3893,6 @@ class Unicom:
                 self.ltzf_task,
                 self.sec_task,
                 self.farm_task,
-                self.cloudpan_task,
                 self.cloud_battle_task,
                 self.shangdu_task,
                 self.uphone_task,
