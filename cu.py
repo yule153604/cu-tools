@@ -295,6 +295,7 @@ class Unicom:
         self.xj_token = self.wocare_token = self.wocare_sid = ""
         self.sec_ticket = self.sec_token = self.sec_jea_id = self.sec_key = ""
         self.session_id = self.token_id = self.rpt_id = ""
+        self.ttlxj_auth_info = None
         self.ttxc_token = self.ttxc_nick_name = self.ttxc_user_id = ""
         self.ttxc_newbie_list = []
         self.ttxc_charge_level = {}
@@ -1256,44 +1257,14 @@ class Unicom:
             await self.market_privilege()
             await self.market_raffle()
 
-    # === 3. 天天领现金 ===
-    async def ttlxj_task(self):
-        self._task_tag = "天天领现金"
-        self.tlog("开始")
-        ticket_info = await self.get_ticket(
-            "https://epay.10010.com/ci-mps-st-web/?webViewNavIsHidden=webViewNavIsHidden"
-        )
-        if not ticket_info:
-            return
+    # === 3. 天天领现金（立减金打卡） ===
+    TTLXJ_CLOCK_URL = (
+        "https://epay.10010.com/ci-mcss-party-web/clockIn/"
+        "?bizFrom=225&bizChannelCode=225"
+    )
 
-        # 授权
-        r = await self.req(
-            "POST",
-            "https://epay.10010.com/woauth2/v2/authorize",
-            json={
-                "response_type": "rptid",
-                "client_id": "73b138fd-250c-4126-94e2-48cbcc8b9cbe",
-                "redirect_uri": "https://epay.10010.com/ci-mps-st-web/",
-                "login_hint": {
-                    "credential_type": "st_ticket",
-                    "credential": ticket_info,
-                    "st_type": "02",
-                    "force_logout": True,
-                    "source": "app_sjyyt",
-                },
-                "device_info": {
-                    "token_id": f"chinaunicom-pro-{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_letters + string.digits, k=13))}",
-                    "trace_id": "".join(
-                        random.choices(string.ascii_letters + string.digits, k=32)
-                    ),
-                },
-            },
-        )
-        if r["code"] != 200:
-            return
-
-        # 认证检查
-        bizchannelinfo = json.dumps(
+    def _ttlxj_bizchannel(self, rpt_id=""):
+        return json.dumps(
             {
                 "bizChannelCode": "225",
                 "disriBiz": "party",
@@ -1301,119 +1272,228 @@ class Unicom:
                 "stType": "",
                 "stDesmobile": "",
                 "source": "",
-                "rptId": self.rpt_id,
+                "rptId": rpt_id or self.rpt_id or "",
                 "ticket": "",
                 "tongdunTokenId": "",
                 "xindunTokenId": "",
-            }
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-        r = await self.req(
+
+    def _ttlxj_headers(self):
+        """
+        H5 axios 拦截器等价头：
+          bizChannelInfo = JSON
+          authInfo = 完整 authInfo 对象 JSON（不是裸 sessionId）
+          tokenid = tokenId
+        """
+        h = {
+            "Referer": self.TTLXJ_CLOCK_URL,
+            "Origin": "https://epay.10010.com",
+            "bizChannelInfo": self._ttlxj_bizchannel(),
+        }
+        auth = getattr(self, "ttlxj_auth_info", None)
+        if isinstance(auth, dict) and auth:
+            h["authInfo"] = json.dumps(auth, ensure_ascii=False, separators=(",", ":"))
+            if auth.get("tokenId"):
+                h["tokenid"] = str(auth.get("tokenId"))
+        elif self.token_id:
+            h["tokenid"] = self.token_id
+        return h
+
+    async def _ttlxj_auth_check(self, rpt_id=""):
+        return await self.req(
             "POST",
             "https://epay.10010.com/ps-pafs-auth-front/v1/auth/check",
-            headers={"bizchannelinfo": bizchannelinfo},
+            headers={
+                "bizchannelinfo": self._ttlxj_bizchannel(rpt_id),
+                "Referer": self.TTLXJ_CLOCK_URL,
+                "Origin": "https://epay.10010.com",
+            },
             json={},
         )
 
-        res = r["data"]
-        if not isinstance(res, dict):
-            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-            return
-        if str(res.get("code")) == "0000":
-            data = res.get("data")
-            auth = data.get("authInfo") if isinstance(data, dict) else None
-            if not isinstance(auth, dict):
-                self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                return
-            self.session_id, self.token_id = (
-                auth.get("sessionId"),
-                auth.get("tokenId"),
+    async def _ttlxj_woauth_rptid(self, login_url: str) -> str:
+        """
+        走 woauth2/login HTML → after-collected-device-digest 跳转链，
+        从最终 Location 提取 party 体系 rptid（与 ttxc_finish_woauth 同源，但保留 rptid）。
+        """
+        headers = {"Referer": "https://epay.10010.com/", "User-Agent": TTXC_UA}
+        r = await self.req("GET", login_url, headers=headers)
+        text = r["data"] if isinstance(r.get("data"), str) else ""
+        match = re.search(r'var token = "([^"]+)"', text)
+        if not match:
+            self.tlog("woauth 登录页无 token")
+            return ""
+        next_url = (
+            "https://epay.10010.com/woauth2/after-collected-device-digest"
+            f"?deviceDigestTraceId=&deviceDigestTokenId=&token={quote(match.group(1))}"
+            f"&source=app_sjyyt"
+        )
+        referer = login_url
+        rptid = ""
+        for _ in range(8):
+            r = await self.req(
+                "GET",
+                next_url,
+                allow_redirects=False,
+                headers={"Referer": referer, "User-Agent": TTXC_UA},
             )
-        elif str(res.get("code")) == "2101000100":
-            # 需要登录获取rptId
-            data = res.get("data")
-            if not isinstance(data, dict):
+            loc = r["headers"].get("location") or r["headers"].get("Location") or ""
+            if not loc:
+                break
+            if loc.startswith("/"):
+                loc = "https://epay.10010.com" + loc
+            q = parse_qs(urlparse(loc).query)
+            if q.get("rptid"):
+                rptid = q["rptid"][0]
+            elif q.get("rptId"):
+                rptid = q["rptId"][0]
+            referer, next_url = next_url, loc
+        return rptid
+
+    async def ttlxj_task(self):
+        """
+        天天领立减金打卡。
+
+        对照 H5 clockIn 与 issue #11（显示已打卡实际没有）:
+          1) party 登录：auth/check → woauth 跳转链拿 rptid → 再 auth/check
+             （旧逻辑用 st-web client 的 rptid 会 invalid audience；
+              未登录时 userDrawInfo 仍 code=0000 但无 day 字段，旧代码误报「已打卡」）
+          2) 业务头 authInfo 必须是完整 JSON 对象字符串
+          3) Mon–Sat: dayN=="1" 可打；"0"=hasGot；周日看 haveGF=="1"
+        """
+        self._task_tag = "天天领现金"
+        self.tlog("开始")
+        self.ttlxj_auth_info = None
+        try:
+            # 1) 未登录 auth/check → 拿 party 的 woauth_login_url
+            r = await self._ttlxj_auth_check("")
+            res = r.get("data")
+            if not isinstance(res, dict):
                 self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
                 return
-            login_url = data.get("woauth_login_url")
-            if login_url:
-                full_url = f"{login_url}https://epay.10010.com/ci-mcss-party-web/clockIn/?bizFrom=225&bizChannelCode=225"
-                r = await self.req("GET", full_url, allow_redirects=False)
-                if loc := r["headers"].get("location") or r["headers"].get("Location"):
-                    if rptid := parse_qs(urlparse(loc).query).get("rptid", [""])[0]:
-                        self.rpt_id = rptid
-                        # 重新认证
-                        bizchannelinfo = json.dumps(
-                            {
-                                "bizChannelCode": "225",
-                                "disriBiz": "party",
-                                "unionSessionId": "",
-                                "stType": "",
-                                "stDesmobile": "",
-                                "source": "",
-                                "rptId": self.rpt_id,
-                                "ticket": "",
-                                "tongdunTokenId": "",
-                                "xindunTokenId": "",
-                            }
-                        )
-                        r = await self.req(
-                            "POST",
-                            "https://epay.10010.com/ps-pafs-auth-front/v1/auth/check",
-                            headers={"bizchannelinfo": bizchannelinfo},
-                            json={},
-                        )
-                        res = r["data"]
-                        if not isinstance(res, dict) or str(res.get("code")) != "0000":
-                            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                            return
-                        data = res.get("data")
-                        auth = data.get("authInfo") if isinstance(data, dict) else None
-                        if not isinstance(auth, dict):
-                            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                            return
-                        self.session_id, self.token_id = (
-                            auth.get("sessionId"),
-                            auth.get("tokenId"),
-                        )
-                    else:
-                        return
-            else:
-                return
-        else:
-            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-            return
 
-        # 查询打卡状态
-        r = await self.req(
-            "POST",
-            "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/userDrawInfo",
-            json={},
-        )
-        if (res := r["data"]) and str(res.get("code")) == "0000":
-            data = res.get("data", {})
-            day_key = f"day{data.get('dayOfWeek')}"
-            if data.get(day_key) == "1":
-                draw_type = "C" if (datetime.now().weekday() + 1) % 7 == 0 else "B"
-                r = await self.req(
-                    "POST",
-                    "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/unifyDrawNew",
-                    data={
-                        "drawType": draw_type,
-                        "bizFrom": "225",
-                        "activityId": "TTLXJ20210330",
-                    },
+            if str(res.get("code")) == "0000":
+                data = res.get("data") if isinstance(res.get("data"), dict) else {}
+                auth = (
+                    data.get("authInfo")
+                    if isinstance(data.get("authInfo"), dict)
+                    else None
                 )
-                if (
-                    (res := r["data"])
-                    and str(res.get("code")) == "0000"
-                    and str(res.get("data", {}).get("returnCode")) == "0"
-                ):
-                    amt = res["data"].get("amount")
+            elif str(res.get("code")) == "2101000100":
+                data = res.get("data") if isinstance(res.get("data"), dict) else {}
+                login_url = str(data.get("woauth_login_url") or "")
+                if not login_url:
                     self.tlog(
-                        f"{res['data'].get('awardTipContent', '').replace('xx', str(amt))}"
+                        f"认证失败(需登录无url): {api_response_err(r, 'auth/check')}"
                     )
+                    return
+                rptid = await self._ttlxj_woauth_rptid(login_url)
+                if not rptid:
+                    self.tlog("获取 rptid 失败")
+                    return
+                self.rpt_id = rptid
+                r = await self._ttlxj_auth_check(rptid)
+                res = r.get("data")
+                if not isinstance(res, dict) or str(res.get("code")) != "0000":
+                    self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
+                    return
+                data = res.get("data") if isinstance(res.get("data"), dict) else {}
+                auth = (
+                    data.get("authInfo")
+                    if isinstance(data.get("authInfo"), dict)
+                    else None
+                )
             else:
-                self.tlog("已打卡")
+                self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
+                return
+
+            if not isinstance(auth, dict) or not auth.get("sessionId"):
+                self.tlog("认证失败: 无 authInfo.sessionId")
+                return
+            self.ttlxj_auth_info = auth
+            self.session_id = str(auth.get("sessionId") or "")
+            self.token_id = str(auth.get("tokenId") or "")
+
+            # 2) 查询打卡状态
+            r = await self.req(
+                "POST",
+                "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/userDrawInfo",
+                headers=self._ttlxj_headers(),
+                data={},
+            )
+            res = r.get("data")
+            if not isinstance(res, dict) or str(res.get("code")) != "0000":
+                self.tlog(f"查询失败: {api_response_err(r, 'userDrawInfo')}")
+                return
+            data = res.get("data") if isinstance(res.get("data"), dict) else {}
+            rc = str(data.get("returnCode") or "")
+            if rc != "0":
+                self.tlog(
+                    f"查询失败: returnCode={rc or '(空)'} "
+                    f"msg={data.get('returnMsg') or res.get('msg')}"
+                )
+                return
+            if "dayOfWeek" not in data:
+                self.tlog(f"查询失败: 无 dayOfWeek {str(data)[:160]}")
+                return
+
+            day_of_week = safe_int(data.get("dayOfWeek"), 0)
+            day_key = f"day{day_of_week}"
+            day_flag = str(data.get(day_key) or "")
+            have_gf = str(data.get("haveGF") or "")
+            # H5 ableToDraw
+            if day_of_week == 7:
+                can_draw = have_gf == "1"
+            else:
+                can_draw = day_flag == "1"
+
+            self.tlog(
+                f"状态 dayOfWeek={day_of_week} {day_key}={day_flag} "
+                f"haveGF={have_gf} weekDrawTimes={data.get('weekDrawTimes')} "
+                f"countAmount={data.get('countAmount')}"
+            )
+
+            if not can_draw:
+                # day/haveGF 为 0 表示 hasGot；其它异常值单独说明
+                if day_of_week == 7:
+                    self.tlog("周日已瓜分或未达瓜分条件" if have_gf != "1" else "不可打卡")
+                else:
+                    self.tlog("已打卡" if day_flag == "0" else f"不可打卡({day_key}={day_flag})")
+                return
+
+            draw_type = "C" if day_of_week == 7 else "B"
+            r = await self.req(
+                "POST",
+                "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/unifyDrawNew",
+                headers=self._ttlxj_headers(),
+                data={
+                    "drawType": draw_type,
+                    "bizFrom": "225",
+                    "activityId": "TTLXJ20210330",
+                },
+            )
+            res = r.get("data")
+            if not isinstance(res, dict):
+                self.tlog(f"打卡失败: {api_response_err(r, 'unifyDrawNew')}")
+                return
+            body = res.get("data") if isinstance(res.get("data"), dict) else {}
+            if str(res.get("code")) == "0000" and str(body.get("returnCode")) == "0":
+                amt = body.get("amount")
+                tip = str(body.get("awardTipContent") or "打卡成功")
+                self.tlog(tip.replace("xx", str(amt)))
+            else:
+                self.tlog(
+                    f"打卡失败: returnCode={body.get('returnCode')} "
+                    f"msg={body.get('returnMsg') or res.get('msg')}"
+                )
+        except Exception as e:
+            self.tlog_exc(e, "ttlxj_task")
+        finally:
+            self.tlog("结束")
+            self._task_tag = None
 
     # === 4. 联通祝福 ===
     def wocare_decode(self, result):
