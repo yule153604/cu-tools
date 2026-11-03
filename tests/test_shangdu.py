@@ -4,8 +4,10 @@ import copy
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from cu import Unicom
-from cu_tasks.common import SHANGDU_APP_ID, SHANGDU_CHANNEL
+from cu_tasks.session import Account
+from cu_tasks.tasks.shangdu import APP_ID as SHANGDU_APP_ID
+from cu_tasks.tasks.shangdu import CHANNEL as SHANGDU_CHANNEL
+from cu_tasks.tasks.shangdu import ShangduTask
 
 # 新 HAR 的领取响应，仅包含 code/msg/SESSION_EXHAUSTED，不含账号或凭证。
 EXHAUSTED_CIPHER = '"048941998d2c90976add294e26bc7fe06573579fd2e45d23cbce96d50e483eeb75fc05f04330e3e38a69018b199e4180cda852ef2395784749d8390f93a8a0262e2c0a62dee55fdb0a27a9ddcaa8905bc94cf13787601ff9decb67651a41067cb742605d887a76044c2d0573aadb599f7b88008d475e7cd0dce153182fd0cb4142d81cb0e18eeffc7c17607d22e838abd24c13901680e732d40771c85541bda80159e25e3fda6da8264b38d9a2161eaf563b89f341e07b399979363ea58ec38733"'
@@ -38,18 +40,17 @@ def node(day=7, status="CLAIMABLE"):
 
 class ShangduTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.account = Unicom("test-online-token")
-        self.account.ecs_token = "test-current-ecs"
-        self.account.province = "河南"
+        account = Account("test-online-token")
+        account.ecs_token = "test-current-ecs"
+        account.province = "河南"
+        self.addAsyncCleanup(account.close)
+        self.task = ShangduTask(account)
+        self.addAsyncCleanup(self.task.close)
         self.messages = []
-        self.account.tlog = self.messages.append
-        self.addAsyncCleanup(self.account.close)
-        sleep = patch("cu_tasks.shangdu.asyncio.sleep", new=AsyncMock())
+        self.task.tlog = self.messages.append
+        sleep = patch("cu_tasks.tasks.shangdu.asyncio.sleep", new=AsyncMock())
         sleep.start()
         self.addCleanup(sleep.stop)
-        limit = patch("cu_tasks.shangdu.SHANGDU_LOTTERY_MAX", None)
-        limit.start()
-        self.addCleanup(limit.stop)
         self.calls = []
 
     def mock_api(self, responses):
@@ -64,9 +65,9 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 raise response
             return copy.deepcopy(response)
 
-        self.account.shangdu_api = AsyncMock(side_effect=call)
-        self.account.shangdu_login = AsyncMock(return_value=True)
-        self.account.shangdu_click_log = AsyncMock()
+        self.task.api = AsyncMock(side_effect=call)
+        self.task.login = AsyncMock(return_value=True)
+        self.task.click_log = AsyncMock()
 
     def task_responses(self, initial, refreshed=None, final=None):
         return [
@@ -77,17 +78,17 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_applet_login_uses_current_ticket_and_authorization(self):
-        self.account.req = AsyncMock(
+        self.task.req = AsyncMock(
             side_effect=[
                 {"code": 200, "data": {"rsp_code": "0000", "ticket": "test-ticket"}},
                 {"code": 200, "data": {"code": 200, "data": {"token": "new-token"}}},
                 {"code": 200, "data": {"code": 200, "data": activity()}},
             ]
         )
-        self.account.shangdu_access_token = "stale-token"
-        self.assertTrue(await self.account.shangdu_login())
-        await self.account.shangdu_init()
-        ticket, login, query = self.account.req.await_args_list
+        self.task.access_token = "stale-token"
+        self.assertTrue(await self.task.login())
+        await self.task.fetch_state()
+        ticket, login, query = self.task.req.await_args_list
         self.assertEqual(
             ticket.kwargs["params"],
             {"appId": SHANGDU_APP_ID, "token": "test-current-ecs"},
@@ -110,30 +111,26 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
             {"code": 200, "data": {"rsp_code": "0000", "ticket": ""}},
             {"code": 200, "data": None},
         ):
-            self.account.shangdu_access_token = "stale-token"
-            self.account.req = AsyncMock(return_value=response)
-            self.assertFalse(await self.account.shangdu_login())
-            self.assertEqual(self.account.shangdu_token(), "")
-            self.assertEqual(self.account.req.await_count, 1)
+            self.task.access_token = "stale-token"
+            self.task.req = AsyncMock(return_value=response)
+            self.assertFalse(await self.task.login())
+            self.assertEqual(self.task.access_token, "")
+            self.assertEqual(self.task.req.await_count, 1)
 
     async def test_login_missing_token_is_failure(self):
-        self.account.req = AsyncMock(
+        self.task.req = AsyncMock(
             side_effect=[
                 {"code": 200, "data": {"rsp_code": "0000", "ticket": "test-ticket"}},
                 {"code": 200, "data": {"code": 200, "data": {}}},
             ]
         )
-        self.assertFalse(await self.account.shangdu_login())
-        self.assertEqual(self.account.shangdu_token(), "")
+        self.assertFalse(await self.task.login())
+        self.assertEqual(self.task.access_token, "")
 
     async def test_har_encrypted_exhaustion_is_not_claim_success(self):
-        self.account.req = AsyncMock(
-            return_value={"code": 200, "data": EXHAUSTED_CIPHER}
-        )
-        response = await self.account.shangdu_api(
-            "POST", "/monthlyRecharge/signIn/reward/7/claim"
-        )
-        self.assertEqual(self.account.req.await_args.kwargs["json"], {})
+        self.task.req = AsyncMock(return_value={"code": 200, "data": EXHAUSTED_CIPHER})
+        response = await self.task.api("POST", "/monthlyRecharge/signIn/reward/7/claim")
+        self.assertEqual(self.task.req.await_args.kwargs["json"], {})
         decoded = response["data"]
         self.assertEqual(decoded["data"]["status"], "SESSION_EXHAUSTED")
         self.mock_api(
@@ -150,7 +147,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        await self.account.shangdu_claim_rewards(
+        await self.task.claim_rewards(
             activity(disabled=False, nodes=[node(7), node(14)])
         )
         self.assertFalse(self.responses)
@@ -160,17 +157,15 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_or_missing_session_never_claims(self):
         self.mock_api([])
         for disabled in (True, "false", None):
-            await self.account.shangdu_claim_rewards(
-                activity(disabled=disabled, nodes=[node()])
-            )
+            await self.task.claim_rewards(activity(disabled=disabled, nodes=[node()]))
         missing = activity(nodes=[node()])
         missing["signInInfo"].pop("signInRewardSession")
-        await self.account.shangdu_claim_rewards(missing)
+        await self.task.claim_rewards(missing)
         self.assertEqual(self.calls, [])
 
     async def test_claimed_monthly_two_and_five_yuan_nodes_are_skipped(self):
         self.mock_api([])
-        await self.account.shangdu_claim_rewards(
+        await self.task.claim_rewards(
             activity(disabled=False, nodes=[node(7, "CLAIMED"), node(14, "CLAIMED")])
         )
         self.assertEqual(self.calls, [])
@@ -188,7 +183,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(claimed)),
             ]
         )
-        await self.account.shangdu_claim_rewards(initial)
+        await self.task.claim_rewards(initial)
         self.assertFalse(self.responses)
 
     async def test_claim_only_never_signs_or_draws(self):
@@ -197,7 +192,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(activity(sign=0, remain=3))),
             ]
         )
-        await self.account.shangdu_task(claim_only=True)
+        await self.task.execute(claim_only=True)
         self.assertFalse(self.responses)
         self.assertEqual(len(self.calls), 1)
 
@@ -216,9 +211,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        await self.account.shangdu_claim_rewards(
-            activity(disabled=False, nodes=[node()])
-        )
+        await self.task.claim_rewards(activity(disabled=False, nodes=[node()]))
         self.assertFalse(self.responses)
         self.assertTrue(any("已读回 CLAIMED" in m for m in self.messages))
 
@@ -234,7 +227,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(current)),
             ]
         )
-        await self.account.shangdu_claim_rewards(current)
+        await self.task.claim_rewards(current)
         self.assertFalse(self.responses)
         self.assertFalse(any("领取成功" in m for m in self.messages))
         self.assertTrue(any("不重试" in m for m in self.messages))
@@ -248,7 +241,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         with self.assertRaises(ValueError):
-            await self.account.shangdu_task()
+            await self.task.execute()
         self.assertFalse(any(method == "POST" for method, _, _ in self.calls))
 
     async def test_newly_signed_nodes_are_used_instead_of_stale_nodes(self):
@@ -269,14 +262,14 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(claimed)),
             ]
         )
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
 
     async def test_non_target_never_signs_or_claims(self):
         data = activity()
         data["isTargetUser"] = False
         self.mock_api([("GET", "/monthlyRecharge/init", ok(data))])
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
 
     async def test_normal_day_draws_once_even_with_large_remaining_count(self):
@@ -288,7 +281,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(activity(remain=98))),
             ]
         )
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
         self.assertEqual(sum(path.endswith("/lottery") for _, path, _ in self.calls), 1)
         self.assertTrue(any("5元话费券" in m for m in self.messages))
@@ -304,7 +297,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(activity(remain=1, festival=True))),
             ]
         )
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
         self.assertTrue(any("30元话费券" in m for m in self.messages))
 
@@ -317,7 +310,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/monthlyRecharge/init", ok(initial)),
             ]
         )
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
         self.assertTrue(any("次数未减少" in m for m in self.messages))
 
@@ -333,13 +326,13 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        await self.account.shangdu_task()
+        await self.task.execute()
         self.assertFalse(self.responses)
         self.assertTrue(any("结果不确定" in m for m in self.messages))
 
     async def test_click_log_matches_applet_event_type(self):
-        self.account.shangdu_api = AsyncMock(return_value=ok())
-        await self.account.shangdu_click_log("SIGN_CLICK", "签到点击", "signIn", "A")
+        self.task.api = AsyncMock(return_value=ok())
+        await self.task.click_log("SIGN_CLICK", "签到点击", "signIn", "A")
         self.assertEqual(
-            self.account.shangdu_api.await_args.kwargs["params"]["eventType"], "CLICK"
+            self.task.api.await_args.kwargs["params"]["eventType"], "CLICK"
         )

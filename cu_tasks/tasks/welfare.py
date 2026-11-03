@@ -2,11 +2,10 @@
 
 import asyncio
 import json
-import os
 import uuid
-from dataclasses import dataclass
 
-from cu_tasks.common import api_response_err, read_int_env, require_int
+from cu_tasks.base import Task
+from cu_tasks.common import api_response_err, require_int
 
 BASE_URL = "https://activity.10010.com/welfare-mall-front/ninePalaceGrid"
 HEADERS = {
@@ -20,37 +19,18 @@ HEADERS = {
     "Origin": "https://img.client.10010.com",
     "Referer": "https://img.client.10010.com/",
 }
-DRAW_HARD_LIMIT = 10
 RESULT_WAIT_SECONDS = 3
 RESULT_POLL_SECONDS = 1
 RESULT_MAX_QUERIES = 4
 DRAW_INTERVAL_SECONDS = 30
 
 
-@dataclass(frozen=True)
-class WelfareConfig:
-    activity_id: str
-    source: str
-    max_draws: int
-
-    @classmethod
-    def from_env(cls) -> "WelfareConfig":
-        activity_id = os.environ.get(
-            "UNICOM_WELFARE_ACTIVITY_ID", "AC20260920094443"
-        ).strip()
-        source = os.environ.get("UNICOM_WELFARE_FROM", "ZXGS97000020362").strip()
-        if not activity_id or not source:
-            raise ValueError("九宫格 activityId/from 不能为空")
-        max_draws = read_int_env("UNICOM_WELFARE_MAX_DRAWS", default=3, minimum=0)
-        if max_draws > DRAW_HARD_LIMIT:
-            raise ValueError(f"UNICOM_WELFARE_MAX_DRAWS 不能超过 {DRAW_HARD_LIMIT}")
-        return cls(activity_id, source, max_draws)
-
-
-class WelfareTasks:
+class WelfareTask(Task):
     """仅消费查询到的次数；写请求不重试，结果不确定时停止。"""
 
-    async def welfare_api(self, action: str, payload: dict) -> dict:
+    name, label = "welfare", "福利商城九宫格"
+
+    async def api(self, action: str, payload: dict) -> dict:
         response = await self.req(
             "POST",
             f"{BASE_URL}/{action}/v1",
@@ -77,27 +57,27 @@ class WelfareTasks:
         return body
 
     @staticmethod
-    def welfare_data(body: dict, action: str) -> dict:
+    def resdata(body: dict, action: str) -> dict:
         data = body.get("resdata")
         if not isinstance(data, dict):
             raise ValueError(f"{action}: resdata 应为对象")
         return data
 
-    async def welfare_count(self, payload: dict) -> int:
-        body = await self.welfare_api("findLotteryCount", payload)
-        data = self.welfare_data(body, "findLotteryCount")
+    async def draw_count(self, payload: dict) -> int:
+        body = await self.api("findLotteryCount", payload)
+        data = self.resdata(body, "findLotteryCount")
         return require_int(data.get("drawCount"), "drawCount", minimum=0)
 
-    async def welfare_result(self, payload: dict) -> None:
+    async def query_result(self, payload: dict) -> None:
         # 新 HAR 中 false 可能是尚未出结果；同一 reqSeq 最多查 4 次。
         for query in range(RESULT_MAX_QUERIES):
             if query:
                 await asyncio.sleep(RESULT_POLL_SECONDS)
-            body = await self.welfare_api("findWinInfo", payload)
+            body = await self.api("findWinInfo", payload)
             if str(body.get("code")) == "1123":
                 self.tlog("抽奖结果: 未中奖")
                 return
-            data = self.welfare_data(body, "findWinInfo")
+            data = self.resdata(body, "findWinInfo")
             won = data.get("isWin")
             if won is True or won == "true":
                 name = data.get("prizeName")
@@ -107,17 +87,16 @@ class WelfareTasks:
                 raise ValueError("findWinInfo: 缺少有效 isWin，停止后续抽奖")
         self.tlog(f"抽奖结果: 连续 {RESULT_MAX_QUERIES} 次查询暂无中奖信息")
 
-    async def welfare_task(self) -> None:
-        self._task_tag = "福利商城九宫格"
-        config = WelfareConfig.from_env()
-        if config.max_draws == 0:
+    async def run(self) -> None:
+        max_draws = self.settings.welfare_max_draws
+        if max_draws == 0:
             self.tlog("抽奖上限为 0，跳过")
             return
-        self.tlog("开始")
-        payload = {"from": config.source, "acId": config.activity_id}
-        activity = self.welfare_data(
-            await self.welfare_api("findActivity", payload), "findActivity"
-        )
+        payload = {
+            "from": self.settings.welfare_source,
+            "acId": self.settings.welfare_activity_id,
+        }
+        activity = self.resdata(await self.api("findActivity", payload), "findActivity")
         # 仅接受抓包已验证的进行中状态和目标用户标记。
         if str(activity.get("acState")) != "2":
             self.tlog(f"活动未开放或状态未知: {activity.get('acState')}")
@@ -125,8 +104,8 @@ class WelfareTasks:
         if activity.get("isTarget") is not True and activity.get("isTarget") != "true":
             self.tlog("当前账号不满足活动参与条件")
             return
-        count = await self.welfare_count(payload)
-        budget = min(count, config.max_draws)
+        count = await self.draw_count(payload)
+        budget = min(count, max_draws)
         self.tlog(
             f"剩余 {count} 次，本轮最多抽奖 {budget} 次；"
             f"活动返回消耗积分配置 {activity.get('consumptionIntegral', '未知')}"
@@ -137,19 +116,19 @@ class WelfareTasks:
             # 每次抽奖生成新 reqSeq；查询结果必须复用，不携带抓包中的设备 ID。
             draw = {**payload, "reqSeq": uuid.uuid4().hex, "imei": self.uuid.upper()}
             try:
-                submitted = await self.welfare_api("luckyDraw", draw)
+                submitted = await self.api("luckyDraw", draw)
             except ValueError as exc:
                 self.tlog_exc(exc, "抽奖提交失败或结果不确定，停止继续提交")
                 # 请求可能已落地；同一 reqSeq 有限查询结果，不重发抽奖。
                 await asyncio.sleep(RESULT_WAIT_SECONDS)
-                await self.welfare_result(draw)
+                await self.query_result(draw)
                 return
             busy = str(submitted.get("code")) == "1129"
             if busy:
                 self.tlog("抽奖返回 1129（活动繁忙），查询结果和剩余次数确认")
             await asyncio.sleep(RESULT_WAIT_SECONDS)
-            await self.welfare_result(draw)
-            remaining = await self.welfare_count(draw)
+            await self.query_result(draw)
+            remaining = await self.draw_count(draw)
             if remaining >= count:
                 self.tlog("次数未减少，停止继续抽奖，本轮不重发该请求")
                 return

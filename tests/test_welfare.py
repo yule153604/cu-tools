@@ -8,8 +8,9 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from cu import Unicom
-from cu_tasks.welfare import WelfareConfig
+from cu_tasks.config import Settings
+from cu_tasks.session import Account
+from cu_tasks.tasks.welfare import WelfareTask
 
 
 def success(data):
@@ -28,29 +29,32 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.environment = patch.dict(os.environ, {}, clear=True)
         self.environment.start()
-        self.wait = patch("cu_tasks.welfare.RESULT_WAIT_SECONDS", 0)
+        self.wait = patch("cu_tasks.tasks.welfare.RESULT_WAIT_SECONDS", 0)
         self.wait.start()
-        polling = patch("cu_tasks.welfare.RESULT_POLL_SECONDS", 0)
+        polling = patch("cu_tasks.tasks.welfare.RESULT_POLL_SECONDS", 0)
         polling.start()
         self.addCleanup(polling.stop)
-        interval = patch("cu_tasks.welfare.DRAW_INTERVAL_SECONDS", 0)
+        interval = patch("cu_tasks.tasks.welfare.DRAW_INTERVAL_SECONDS", 0)
         interval.start()
         self.addCleanup(interval.stop)
         self.addCleanup(self.environment.stop)
         self.addCleanup(self.wait.stop)
-        self.account = Unicom("test-token")
-        await self.account.close()
+        self.account = Account("test-token", transport=httpx.MockTransport(self.handle))
         self.calls = []
         self.responses = []
         self.messages = []
-        self.account.tlog = self.messages.append
-        self.account.client = httpx.AsyncClient(
-            transport=httpx.MockTransport(self.handle)
-        )
         self.account.client.cookies.set(
             "ecs_token", "test-session", domain=".10010.com"
         )
         self.addAsyncCleanup(self.account.close)
+
+    async def run_task(self, **settings):
+        task = WelfareTask(self.account, Settings(**settings))
+        task.tlog = self.messages.append
+        try:
+            await task.run()
+        finally:
+            await task.close()
 
     def handle(self, request):
         action = request.url.path.split("/")[-2]
@@ -86,7 +90,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                     ("findLotteryCount", success({"drawCount": str(remaining)})),
                 ]
             )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertFalse(self.responses)
         first, second = self.calls[2][1], self.calls[5][1]
         self.assertEqual(first, self.calls[3][1])
@@ -108,7 +112,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findLotteryCount", success({"drawCount": "0"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertFalse(self.responses)
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
         self.assertTrue(all(p == self.calls[2][1] for _, p in self.calls[3:]))
@@ -124,7 +128,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
             self.responses.append(
                 ("findLotteryCount", success({"drawCount": str(remaining)}))
             )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertFalse(self.responses)
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 2)
         self.assertEqual([a for a, _ in self.calls].count("findWinInfo"), 8)
@@ -143,7 +147,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         with self.assertRaises(ValueError):
-            await self.account.welfare_task()
+            await self.run_task()
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
 
     async def test_timeout_only_polls_result_and_never_resubmits(self):
@@ -152,20 +156,20 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
             [("luckyDraw", httpx.ReadTimeout("simulated timeout"))]
             + [("findWinInfo", success({"isWin": False}))] * 4
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertFalse(self.responses)
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
         self.assertEqual(self.calls[-1][0], "findWinInfo")
 
     async def test_zero_count_does_not_draw(self):
         self.initial("0")
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertEqual(len(self.calls), 2)
 
     async def test_unopened_and_non_target_stop_before_count(self):
         for overrides in ({"acState": "1"}, {"isTarget": "false"}, {"acState": None}):
             self.responses = [("findActivity", success({**ACTIVITY, **overrides}))]
-            await self.account.welfare_task()
+            await self.run_task()
             self.assertFalse(self.responses)
         self.assertTrue(all(action == "findActivity" for action, _ in self.calls))
 
@@ -186,7 +190,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findLotteryCount", success({"drawCount": "3"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertEqual([action for action, _ in self.calls].count("luckyDraw"), 1)
         self.assertEqual(self.calls[-1][1], self.calls[-2][1])
         self.assertTrue(any("1129" in message for message in self.messages))
@@ -206,7 +210,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findLotteryCount", success({"drawCount": "0"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertFalse(self.responses)
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 2)
         self.assertFalse(any("异常" in message for message in self.messages))
@@ -216,7 +220,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
         for code in ("1123", "1129"):
             self.responses = [("findActivity", {"code": code, "resdata": ACTIVITY})]
             with self.assertRaises(ValueError):
-                await self.account.welfare_task()
+                await self.run_task()
 
     async def test_timeout_reconciles_without_resubmitting(self):
         self.initial()
@@ -226,7 +230,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findWinInfo", success({"isWin": True, "prizeName": "测试奖品"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
         self.assertTrue(any("测试奖品" in m for m in self.messages))
 
@@ -239,7 +243,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findLotteryCount", success({"drawCount": "3"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task()
         self.assertEqual(len(self.calls), 5)
         self.assertTrue(any("次数未减少" in m for m in self.messages))
 
@@ -247,7 +251,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
         for count in (None, True, -1, "abc", 1.5, {}, ""):
             self.initial(count)
             with self.assertRaises(ValueError):
-                await self.account.welfare_task()
+                await self.run_task()
         self.assertNotIn("luckyDraw", [a for a, _ in self.calls])
 
     async def test_invalid_response_fails_before_draw(self):
@@ -259,7 +263,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.responses = [("findActivity", response)]
             with self.assertRaises(ValueError):
-                await self.account.welfare_task()
+                await self.run_task()
 
     async def test_result_query_failure_stops_further_draws(self):
         self.initial()
@@ -270,13 +274,10 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         with self.assertRaises(ValueError):
-            await self.account.welfare_task()
+            await self.run_task()
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
 
     async def test_draw_limit_and_activity_override(self):
-        os.environ.update(
-            UNICOM_WELFARE_MAX_DRAWS="1", UNICOM_WELFARE_ACTIVITY_ID="next-period"
-        )
         self.initial("999")
         self.responses.extend(
             [
@@ -285,13 +286,12 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
                 ("findLotteryCount", success({"drawCount": "998"})),
             ]
         )
-        await self.account.welfare_task()
+        await self.run_task(welfare_max_draws=1, welfare_activity_id="next-period")
         self.assertTrue(all(p["acId"] == "next-period" for _, p in self.calls))
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
 
     async def test_zero_limit_makes_no_requests(self):
-        os.environ["UNICOM_WELFARE_MAX_DRAWS"] = "0"
-        await self.account.welfare_task()
+        await self.run_task(welfare_max_draws=0)
         self.assertEqual(self.calls, [])
 
 
@@ -309,4 +309,4 @@ class ConfigTests(unittest.TestCase):
                 patch.dict(os.environ, {name: value}, clear=True),
             ):
                 with self.assertRaises(ValueError):
-                    WelfareConfig.from_env()
+                    Settings.from_env()
