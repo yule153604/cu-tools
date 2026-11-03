@@ -1,6 +1,9 @@
 .claude/
 .vscode/
+.ruff_cache/
 __pycache__/
+.DS_Store
+backups/
 *.har
 token.md
 *.log

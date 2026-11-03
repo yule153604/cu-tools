@@ -1,0 +1,3 @@
+httpx>=0.27,<1
+pycryptodome>=3.20,<4
+gmssl>=3.2,<4
