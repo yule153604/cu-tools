@@ -6,20 +6,22 @@ from cu_tasks.tasks.market import MarketTask
 from cu_tasks.tasks.security import SecurityTask
 from cu_tasks.tasks.shangdu import ShangduTask
 from cu_tasks.tasks.sign import SignTask
+from cu_tasks.tasks.slot import SlotTask
 from cu_tasks.tasks.uphone import UphoneTask
 from cu_tasks.tasks.welfare import WelfareTask
 from cu_tasks.tasks.woread import WoreadTask
 from cu_tasks.tasks.xinjiang import XinjiangTask
 
 # 顺序即串行（UNICOM_TASK_CONCURRENCY=1）时的执行顺序与通知汇总顺序。
-# 权益超市排第一：10 点开抢需要尽早进入等待。
+# 权益超市排第一：10 点开抢需要尽早进入等待；长等待抽奖与农场前置，重叠休眠窗口减少总耗时。
 TASKS: tuple[type[Task], ...] = (
     MarketTask,
-    SignTask,
     WelfareTask,
+    SlotTask,
+    FarmTask,
+    SignTask,
     XinjiangTask,
     SecurityTask,
-    FarmTask,
     ShangduTask,
     UphoneTask,
     WoreadTask,

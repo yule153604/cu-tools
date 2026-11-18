@@ -20,6 +20,18 @@ UA = (
     "devicetype{deviceBrand:Xiaomi,deviceModel:MI 8}"
 )
 NEWBIE_STEPS = ("G01", "G02", "G03", "G03_2", "G04", "G05", "G09", "G10", "G11", "G12")
+CHARGE_COST = 50
+SEED_COST = 100
+TRANSIENT_TASK_ERRORS = (
+    "i/o error",
+    "connection reset",
+    "timed out",
+    "timeout",
+    "网络/请求异常",
+    "http=50",
+    "繁忙",
+    "稍后",
+)
 
 
 class FarmTask(Task):
@@ -32,7 +44,9 @@ class FarmTask(Task):
         self.token = self.nick_name = self.user_id = ""
         self.newbie_list = []
         self.charge_level = {}
+        self.carbon: int | None = None
         self.no_energy = False
+        self.no_buy_energy = False
 
     def headers(self, auth=True, ecs=False):
         if ecs:
@@ -154,7 +168,8 @@ class FarmTask(Task):
         if not self.user_id or not self.token:
             self.tlog("登录响应缺少 userId/token")
             return False
-        carbon = self.charge_level.get("carbonNum", 0)
+        carbon = safe_int(self.charge_level.get("carbonNum"), 0)
+        self.carbon = carbon
         eco = self.charge_level.get("ecologyAmount", 0)
         self.tlog(f"登录成功，碳能量{carbon}g，生态值{eco}")
         if update_nick and not self.nick_name and self.newbie_done():
@@ -351,14 +366,40 @@ class FarmTask(Task):
         self.tlog("新手任务已完成")
         return True
 
+    @staticmethod
+    def _is_transient_error(err) -> bool:
+        lowered = str(err or "").lower()
+        return any(k in lowered for k in TRANSIENT_TASK_ERRORS)
+
+    async def _post_with_retry(self, path, payload, attempts=3):
+        data = {}
+        for attempt in range(attempts):
+            try:
+                data = await self.post(path, payload)
+            except ValueError as exc:
+                if attempt + 1 < attempts and self._is_transient_error(exc):
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                raise
+            if data.get("code") == 0:
+                return data
+            if attempt + 1 < attempts and self._is_transient_error(data.get("msg", "")):
+                await asyncio.sleep(1.0 * (attempt + 1))
+                continue
+            return data
+        return data
+
     async def sign(self):
-        info = await self.post("/client/v1/sign/info", {})
+        info = await self._post_with_retry("/client/v1/sign/info", {})
         code = (info.get("data") or {}).get("signinCode")
-        if not code:
+        if info.get("code") != 0 or not code:
             self.tlog("获取签到码失败")
             return
-        user = await self.post("/client/v1/sign/user", {"code": code})
-        last_time = str((user.get("data") or {}).get("lastSigninTime") or "")
+        user = await self._post_with_retry("/client/v1/sign/user", {"code": code})
+        if user.get("code") != 0 or not isinstance(user.get("data"), dict):
+            self.tlog(f"查询签到状态失败[{user.get('code')}]: {user.get('msg', '')}")
+            return
+        last_time = str(user["data"].get("lastSigninTime") or "")
         if last_time[:10] == datetime.now().strftime("%Y-%m-%d"):
             self.tlog("今日已签到")
             return
@@ -386,12 +427,19 @@ class FarmTask(Task):
                 energy = max(after - before, 0)
             if data.get("chargeLevel"):
                 self.charge_level = data.get("chargeLevel") or self.charge_level
-            self.tlog(f"签到成功 +{energy}g" if energy else "签到成功")
+                if self.charge_level.get("carbonNum") is not None:
+                    self.carbon = safe_int(self.charge_level.get("carbonNum"), 0)
+            elif self.carbon is not None:
+                self.carbon += energy
+            if not energy and not sign_data:
+                self.tlog("今日已签到")
+            else:
+                self.tlog(f"签到成功 +{energy}g" if energy else "签到成功")
         else:
             self.tlog(f"签到失败[{data.get('code')}]: {data.get('msg', '')}")
 
     async def get_tasks(self):
-        data = await self.post("/client/v1/task/list", {})
+        data = await self._post_with_retry("/client/v1/task/list", {})
         if data.get("code") != 0:
             self.tlog(f"获取任务列表失败[{data.get('code')}]: {data.get('msg', '')}")
             return []
@@ -406,18 +454,27 @@ class FarmTask(Task):
         task_id = task.get("taskCode")
         if not task_id:
             return False
-        data = await self.post("/client/v1/task/finish", {"taskId": task_id})
         name = task.get("taskTitle", task_id)
+        data = await self._post_with_retry(
+            "/client/v1/task/finish", {"taskId": task_id}
+        )
         if data.get("code") == 0:
-            reward = task.get("carbonEnergyAmount") or 0
+            reward = safe_int(task.get("carbonEnergyAmount"), 0)
+            if isinstance(data.get("chargeLevel"), dict) and (
+                data["chargeLevel"].get("carbonNum") is not None
+            ):
+                self.carbon = safe_int(data["chargeLevel"].get("carbonNum"), 0)
+            elif self.carbon is not None or reward > 0:
+                self.carbon = (self.carbon or 0) + reward
             self.tlog(f"领取[{name}]成功 +{reward}g")
             return True
         self.tlog(f"领取[{name}]失败[{data.get('code')}]: {data.get('msg', '')}")
         return False
 
     async def do_task(self, task):
-        data = await self.post("/client/v1/task/do", {"taskId": task.get("taskCode")})
-        name = task.get("taskTitle", task.get("taskCode", ""))
+        code = task.get("taskCode")
+        name = task.get("taskTitle", code or "")
+        data = await self._post_with_retry("/client/v1/task/do", {"taskId": code})
         if data.get("code") == 0:
             self.tlog(f"已执行[{name}]")
             return True
@@ -501,7 +558,19 @@ class FarmTask(Task):
         items = (data.get("data") or {}).get("list") or []
         return items[0].get("itemNo", "") if items else ""
 
+    def _can_buy_seed(self) -> bool:
+        if self.no_energy or self.no_buy_energy:
+            return False
+        if self.carbon is not None and self.carbon < SEED_COST:
+            if self.carbon < CHARGE_COST:
+                self.no_energy = True
+            self.no_buy_energy = True
+            return False
+        return True
+
     async def plant_land(self, land_index, plant_id=None):
+        if not self._can_buy_seed():
+            return None
         plant_id = plant_id or await self.get_plant_id()
         if not plant_id or not land_index:
             return None
@@ -509,8 +578,21 @@ class FarmTask(Task):
             "/client/v1/plant/buy", {"plantId": plant_id, "gameCfgId": ""}
         )
         if buy.get("code") != 0:
-            self.tlog(f"购买种子失败[{buy.get('code')}]: {buy.get('msg', '')}")
+            msg = str(buy.get("msg", ""))
+            if any(k in msg for k in ("能量不足", "余额不足")):
+                self.no_buy_energy = True
+                if self.carbon is not None and self.carbon >= SEED_COST:
+                    self.carbon = SEED_COST - 1
+                self.tlog(f"地块{land_index}碳能量不足，暂不补种")
+                return None
+            self.tlog(f"购买种子失败[{buy.get('code')}]: {msg}")
             return None
+        if isinstance(buy.get("chargeLevel"), dict) and (
+            buy["chargeLevel"].get("carbonNum") is not None
+        ):
+            self.carbon = safe_int(buy["chargeLevel"].get("carbonNum"), 0)
+        elif self.carbon is not None:
+            self.carbon = max(self.carbon - SEED_COST, 0)
         data = await self.post(
             "/plant/v1/planting", {"landIndex": land_index, "plantId": plant_id}
         )
@@ -533,19 +615,34 @@ class FarmTask(Task):
             if land.get("status") in [2, 3] and (land.get("plant") or {}).get("plantId")
         ]
         empty = [land for land in lands if land.get("status") == 1]
-        if not empty:
+        if not empty or not self._can_buy_seed():
             return active
         plant_id = await self.get_plant_id()
         if not plant_id:
             return active
         for land in empty:
+            if not self._can_buy_seed():
+                break
             planted = await self.plant_land(land.get("landIndex"), plant_id)
             if planted:
                 active.append(planted)
         return active
 
+    @staticmethod
+    def _land_maturity_key(land) -> tuple[int, int]:
+        plant = (land or {}).get("plant") or {}
+        return (
+            safe_int(plant.get("curLevel"), 0),
+            safe_int(plant.get("curCarbonNum"), 0),
+        )
+
     async def charge_land(self, land, mock=None):
-        if not land:
+        if not land or (mock is None and land.get("status") == 2):
+            return None
+        if mock is None and (
+            self.no_energy or (self.carbon is not None and self.carbon < CHARGE_COST)
+        ):
+            self.no_energy = True
             return None
         plant = land.get("plant") or {}
         plant_id, land_index = plant.get("plantId"), land.get("landIndex")
@@ -558,14 +655,26 @@ class FarmTask(Task):
         if data.get("code") == 0:
             self.tlog(f"地块{land_index}充能成功")
             result = data.get("data") or {}
+            if isinstance(data.get("chargeLevel"), dict) and (
+                data["chargeLevel"].get("carbonNum") is not None
+            ):
+                self.carbon = safe_int(data["chargeLevel"].get("carbonNum"), 0)
+            elif mock is None and self.carbon is not None:
+                self.carbon = max(self.carbon - CHARGE_COST, 0)
+            if mock is None and self.carbon is not None and self.carbon < CHARGE_COST:
+                self.no_energy = True
             if result and not result.get("plant"):
                 result["plant"] = plant
             return result or land
-        self.tlog(
-            f"地块{land_index}充能失败[{data.get('code')}]: {data.get('msg', '')}"
-        )
-        if "余额不足" in str(data.get("msg", "")):
+        msg = str(data.get("msg", ""))
+        if any(k in msg for k in ("余额不足", "能量不足")):
             self.no_energy = True
+            self.no_buy_energy = True
+            if self.carbon is not None and self.carbon >= CHARGE_COST:
+                self.carbon = CHARGE_COST - 1
+            self.tlog(f"地块{land_index}碳能量不足，停止充能")
+            return None
+        self.tlog(f"地块{land_index}充能失败[{data.get('code')}]: {msg}")
         return None
 
     async def harvest_and_replant(self, land):
@@ -608,11 +717,16 @@ class FarmTask(Task):
         while remaining > 0:
             if self.no_energy:
                 return
-            immature = [
-                land
-                for land in active
-                if land.get("status") == 3 and (land.get("plant") or {}).get("plantId")
-            ]
+            immature = sorted(
+                (
+                    land
+                    for land in active
+                    if land.get("status") == 3
+                    and (land.get("plant") or {}).get("plantId")
+                ),
+                key=self._land_maturity_key,
+                reverse=True,
+            )
             if not immature:
                 self.tlog("未成熟作物不足，提前结束10次充能补足")
                 return
@@ -629,6 +743,17 @@ class FarmTask(Task):
             if not progressed:
                 self.tlog("充能未成功，提前结束10次充能补足")
                 return
+
+    async def _harvest_mature_lands(self, active):
+        updated = []
+        for land in active:
+            if land.get("status") == 2:
+                replanted = await self.harvest_and_replant(land)
+                if replanted:
+                    updated.append(replanted)
+            else:
+                updated.append(land)
+        return updated
 
     async def farm_tasks(self, tasks):
         charge_task = next(
@@ -651,31 +776,32 @@ class FarmTask(Task):
         harvest_pending = (
             harvest_task if (harvest_task or {}).get("taskStatus") == "UNDO" else None
         )
-        if not charge_pending and not land_pending and not harvest_pending:
-            return
         lands = await self.get_lands()
         active = await self.ensure_planted_lands(lands)
+        active = await self._harvest_mature_lands(active)
+        if not charge_pending and not land_pending and not harvest_pending:
+            return
+        done_land = max(safe_int((land_pending or {}).get("doneValue")), 0)
         need_land = max(
-            safe_int((land_pending or {}).get("finishValue"))
-            - safe_int((land_pending or {}).get("doneValue")),
+            safe_int((land_pending or {}).get("finishValue")) - done_land,
             0,
         )
-        if harvest_pending and not charge_pending and not land_pending:
-            for land in active:
-                if land.get("status") == 2:
-                    await self.harvest_and_replant(land)
         if not active:
             self.tlog("没有可充能作物")
             return
         charged = 0
-        for i, land in enumerate(active[:need_land]):
-            if self.no_energy:
-                break
-            result = await self.charge_land(land)
-            if result:
-                active[i] = result
-                charged += 1
-                await asyncio.sleep(1)
+        immature_idx = [i for i, land in enumerate(active) if land.get("status") == 3]
+        if need_land > 0 and immature_idx:
+            offset = done_land % len(immature_idx)
+            rotated = immature_idx[offset:] + immature_idx[:offset]
+            for idx in rotated[:need_land]:
+                if self.no_energy:
+                    break
+                result = await self.charge_land(active[idx])
+                if result:
+                    active[idx] = result
+                    charged += 1
+                    await asyncio.sleep(1)
         need_charge = max(
             safe_int((charge_pending or {}).get("finishValue"))
             - safe_int((charge_pending or {}).get("doneValue"))
@@ -683,7 +809,7 @@ class FarmTask(Task):
             0,
         )
         await self.complete_charge_task(active, need_charge)
-        for land in active:
+        for land in sorted(active, key=self._land_maturity_key, reverse=True):
             await self.grow_land_to_harvest(land)
 
     async def run(self):
@@ -697,8 +823,33 @@ class FarmTask(Task):
         await self.sign()
         tasks = await self.get_tasks()
         await self.claim_ready_tasks(tasks, claimed)
-        await self.do_jump_tasks(tasks)
-        await self.do_garbage_task(tasks)
-        await self.farm_tasks(tasks)
-        tasks = await self.get_tasks()
-        await self.claim_ready_tasks(tasks, claimed)
+        jumped = await self.do_jump_tasks(tasks)
+        garbaged = await self.do_garbage_task(tasks)
+        if jumped or garbaged:
+            if not garbaged:
+                await asyncio.sleep(1)
+            tasks = await self.get_tasks()
+            await self.claim_ready_tasks(tasks, claimed)
+        self.no_energy = False
+        self.no_buy_energy = False
+        for _ in range(3):
+            await self.farm_tasks(tasks)
+            tasks = await self.get_tasks()
+            newly_claimed = await self.claim_ready_tasks(tasks, claimed)
+            if newly_claimed <= 0:
+                break
+            self.no_energy = False
+            self.no_buy_energy = False
+            has_undo_farm = any(
+                t.get("taskStatus") == "UNDO"
+                and any(
+                    k in t.get("taskTitle", "")
+                    for k in ("10次作物充能", "三块不同", "收获一次作物")
+                )
+                for t in tasks
+            )
+            if not has_undo_farm:
+                lands = await self.get_lands()
+                active = await self.ensure_planted_lands(lands)
+                await self._harvest_mature_lands(active)
+                break

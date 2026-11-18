@@ -102,11 +102,37 @@ class SecurityTask(Task):
             self.tlog("今日签到已完成或无签到任务")
             return
         code = sign.get("taskCode")
-        # 与原流程一致：签到后总是尝试领取，两步结果分别记录
-        for path, action in (("uasptask/sign", "签到"), ("jftask/receive", "领取奖励")):
-            r = await jf.post(path, {"taskCode": code})
-            res = r.get("data")
-            if isinstance(res, dict) and str(res.get("code")) == "0000":
-                self.tlog(f"{action}成功")
-            else:
-                self.tlog(f"{action}失败: {api_response_err(r, path)}")
+        r = await jf.post("uasptask/sign", {"taskCode": code})
+        res = r.get("data")
+        biz_code = str(res.get("code", "")) if isinstance(res, dict) else ""
+        msg = (
+            str(res.get("msg") or res.get("message") or "")
+            if isinstance(res, dict)
+            else ""
+        )
+        if biz_code == "0000":
+            self.tlog("签到成功")
+        elif biz_code == "4016" or "付费用户" in msg:
+            self.tlog(f"非付费会员跳过签到: {msg or biz_code}")
+            return
+        elif biz_code == "4005" or any(k in msg for k in ("已完成", "重复", "已签")):
+            self.tlog("今日签到已完成")
+            return
+        else:
+            self.tlog(f"签到失败: {api_response_err(r, 'uasptask/sign')}")
+            return
+
+        r = await jf.post("jftask/receive", {"taskCode": code})
+        res = r.get("data")
+        recv_code = str(res.get("code", "")) if isinstance(res, dict) else ""
+        recv_msg = (
+            str(res.get("msg") or res.get("message") or "")
+            if isinstance(res, dict)
+            else ""
+        )
+        if recv_code == "0000":
+            self.tlog("领取奖励成功")
+        elif recv_code == "4012" or "自动发放" in recv_msg:
+            self.tlog("奖励已自动发放")
+        else:
+            self.tlog(f"领取奖励失败: {api_response_err(r, 'jftask/receive')}")

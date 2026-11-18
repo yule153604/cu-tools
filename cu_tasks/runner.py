@@ -8,13 +8,71 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from cu_tasks.base import Task
-from cu_tasks.common import format_exception_detail
+from cu_tasks.common import format_exception_detail, redact_text
 from cu_tasks.config import Settings
 from cu_tasks.session import Account
 
 NOTIFY_TITLE = "中国联通任务"
-NOTIFY_KEYWORDS = ("失败", "异常", "成功", "抽奖")
+NOTIFY_KEYWORDS = ("失败", "异常", "成功", "抽奖", "中奖")
+NOTIFY_NOISE = (
+    "登录成功",
+    "SSO 成功",
+    "换票成功",
+    "读章节成功",
+    "更新阅读进度成功",
+    "充能成功",
+    "惊喜解锁成功",
+    "冬日领次数成功",
+    "领次数跳过",
+    "领奖受限",
+    "只能打卡一次",
+    "抽奖次数:",
+    "抽奖次数=",
+    "抽奖次数已用完",
+    "抽奖次数未减少",
+    "最多抽奖 ",
+    "无可用抽奖次数",
+    "抽奖上限为 0",
+    "无抽奖次数",
+    "跳过抽奖",
+    "停止抽奖",
+    "抽奖停止",
+    "停止继续抽奖",
+    "抽奖返回 1129",
+    "冬日抽奖次数",
+    "冬日抽奖结束",
+    "今日抽奖机会已用完",
+    "十连次数已用完",
+    "奖品=无",
+    "未中奖",
+)
 NOTIFY_MAX_LINES = 100
+_NOTIFY_SINGLE_KEYS = (
+    "BARK_PUSH",
+    "FSKEY",
+    "IGOT_PUSH_KEY",
+    "PUSH_KEY",
+    "DEER_KEY",
+    "PUSH_PLUS_TOKEN",
+    "WE_PLUS_BOT_TOKEN",
+    "QYWX_AM",
+    "QYWX_KEY",
+    "PUSHME_KEY",
+    "NTFY_TOPIC",
+    "OPENILINK_APP_TOKEN",
+)
+_NOTIFY_GROUP_KEYS = (
+    ("DD_BOT_TOKEN", "DD_BOT_SECRET"),
+    ("GOBOT_URL", "GOBOT_QQ"),
+    ("GOTIFY_URL", "GOTIFY_TOKEN"),
+    ("CHAT_URL", "CHAT_TOKEN"),
+    ("QMSG_KEY", "QMSG_TYPE"),
+    ("TG_BOT_TOKEN", "TG_USER_ID"),
+    ("AIBOTK_KEY", "AIBOTK_TYPE", "AIBOTK_NAME"),
+    ("SMTP_SERVER", "SMTP_SSL", "SMTP_EMAIL", "SMTP_PASSWORD", "SMTP_NAME"),
+    ("CHRONOCAT_URL", "CHRONOCAT_QQ", "CHRONOCAT_TOKEN"),
+    ("WEBHOOK_URL", "WEBHOOK_METHOD"),
+)
 
 
 async def run_task(task: Task, gate: asyncio.Semaphore):
@@ -68,25 +126,71 @@ def setup_timezone():
         time.tzset()
 
 
+def _should_notify_line(line: str) -> bool:
+    if any(k in line for k in ("失败", "异常")):
+        return True
+    if not any(k in line for k in NOTIFY_KEYWORDS):
+        return False
+    return not any(noise in line for noise in NOTIFY_NOISE)
+
+
 def notify_lines(lines: list[str]) -> list[str]:
-    picked = [line for line in lines if any(k in line for k in NOTIFY_KEYWORDS)]
+    picked = [line for line in lines if _should_notify_line(line)]
     if len(picked) > NOTIFY_MAX_LINES:
         rest = len(picked) - NOTIFY_MAX_LINES
         picked = picked[:NOTIFY_MAX_LINES] + [f"... 其余 {rest} 行已省略"]
     return picked
 
 
+def _has_notify_channel(cfg) -> bool:
+    if not cfg:
+        return False
+
+    def val(key: str) -> str:
+        raw = cfg.get(key, "")
+        if isinstance(raw, bool):
+            return "true" if raw else ""
+        return str(raw or "").strip()
+
+    if val("CONSOLE").lower() not in ("", "false", "0"):
+        return True
+    if any(val(k) for k in _NOTIFY_SINGLE_KEYS):
+        return True
+    if any(all(val(k) for k in group) for group in _NOTIFY_GROUP_KEYS):
+        return True
+    return bool(
+        val("WXPUSHER_APP_TOKEN")
+        and (val("WXPUSHER_TOPIC_IDS") or val("WXPUSHER_UIDS"))
+    )
+
+
+def notify_configured(env=None) -> bool:
+    if _has_notify_channel(os.environ if env is None else env):
+        return True
+    if env is not None:
+        return False
+    try:
+        import notify  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    return _has_notify_channel(getattr(notify, "push_config", None))
+
+
 def notify_send(title, content):
+    if not notify_configured():
+        return
     # notify.py 的一言接口无超时、推送线程 join 也无超时，必须隔离，否则会卡死青龙任务槽
-    os.environ.setdefault("HITOKOTO", "false")
+    os.environ["HITOKOTO"] = "false"
 
     def _send():
         try:
-            from notify import send
+            import notify  # type: ignore[import-not-found]
 
-            send(title, content)
+            if isinstance(getattr(notify, "push_config", None), dict):
+                notify.push_config["HITOKOTO"] = False
+            notify.send(title, content)
         except Exception as e:
-            print(f"推送失败: {e}")
+            print(redact_text(f"推送失败: {e}"))
 
     worker = threading.Thread(target=_send, daemon=True)
     worker.start()
@@ -106,7 +210,7 @@ async def main(task_types: Sequence[type[Task]] | None = None, *, notify=True):
 
             task_types = select_tasks(settings.only_tasks, settings.skip_tasks)
     except ValueError as exc:
-        print(f"配置错误: {exc}", flush=True)
+        print(redact_text(f"配置错误: {exc}"), flush=True)
         return
     if not task_types:
         print("没有需要执行的任务")
@@ -125,7 +229,10 @@ async def main(task_types: Sequence[type[Task]] | None = None, *, notify=True):
     lines: list[str] = []
     for account, result in zip(accounts, results):
         if isinstance(result, BaseException):
-            line = f"账号{account.idx} 未捕获异常: {format_exception_detail(result)}"
+            detail = format_exception_detail(result, mobile=account.mobile)
+            line = redact_text(
+                f"账号{account.idx} 未捕获异常: {detail}", mobile=account.mobile
+            )
             print(line, flush=True)
             lines.append(line)
         else:

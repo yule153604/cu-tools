@@ -64,10 +64,12 @@ class Task:
 
     # --- 日志 ---
     def tlog(self, msg):
-        self.account.emit(format_line(self.idx, msg, self.label), self.lines)
+        self.account.emit(
+            format_line(self.idx, msg, self.label, mobile=self.mobile), self.lines
+        )
 
     def tlog_exc(self, e, action=None):
-        self.tlog(f"异常: {format_exception_detail(e, action)}")
+        self.tlog(f"异常: {format_exception_detail(e, action, mobile=self.mobile)}")
 
     # --- 请求与换票 ---
     async def req(self, method, url, **kw):

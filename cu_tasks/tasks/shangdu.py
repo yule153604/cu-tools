@@ -6,12 +6,13 @@ import json
 import random
 import string
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 from gmssl import sm2
 
 from cu_tasks.base import Task
-from cu_tasks.common import require_int
+from cu_tasks.common import require_int, safe_int
 
 BASE = "https://app.shangdu.com"
 UA = (
@@ -33,7 +34,14 @@ LOTTERY_PRIZES = (
     "腾讯视频VIP会员-月卡",
 )
 LOTTERY_FESTIVAL_PRIZES = ("30元话费券", *LOTTERY_PRIZES)
-REWARD_DAYS = (7, 14)  # 每月 2 元券、5 元券各 1 张
+REWARD_DAYS = (14, 7)  # 优先抢高面额 14 天节点（5 元券），再抢 7 天节点（2 元券）
+MONTHLY_SIGN_CAP = 14
+CLAIM_HOURS = (9, 11, 15, 19)
+CLAIM_WAIT_MAX_SECONDS = 180
+CLAIM_PREWARM_LEAD_SECONDS = 6.0
+CLAIM_OPEN_BUFFER_SECONDS = 0.02
+CLAIM_BUSY_RETRIES = 3
+CLAIM_BUSY_WAIT_SECONDS = 0.25
 
 _SM2 = None
 
@@ -53,7 +61,10 @@ class ShangduTask(Task):
     provinces = ("河南",)
     claim_only = False
 
-    access_token = ""
+    def __init__(self, account, settings=None):
+        super().__init__(account, settings)
+        self.access_token = ""
+        self._claim_dirty = False
 
     async def run(self):
         await self.execute(claim_only=self.claim_only)
@@ -232,8 +243,58 @@ class ShangduTask(Task):
             raise ValueError("商都 init.data 应为对象")
         return data
 
-    async def claim_rewards(self, activity):
-        """仅在场次明确可领时补领；业务码 200 不代表发券成功。"""
+    @staticmethod
+    def next_claim_window(now: datetime | None = None) -> datetime | None:
+        now = now or datetime.now()
+        for hour in CLAIM_HOURS:
+            target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if target > now:
+                return target
+        return None
+
+    async def wait_until_claim_session(self, activity) -> tuple[dict, bool]:
+        """59 分提前预登录时，开场前数秒预热连接并在整点直接进入抢券。"""
+        sign_info = activity.get("signInInfo") or {}
+        nodes = sign_info.get("rewardNodes") or []
+        if not any(node.get("status") == "CLAIMABLE" for node in nodes):
+            return activity, False
+        session = sign_info.get("signInRewardSession") or {}
+        if session.get("disabled") is False:
+            return activity, False
+        now = datetime.now()
+        target = self.next_claim_window(now)
+        if target is None:
+            return activity, False
+        wait = (target - now).total_seconds()
+        if wait <= 0 or wait > CLAIM_WAIT_MAX_SECONDS:
+            return activity, False
+        self.tlog(f"等待 {target:%H:%M} 放券场次开放 {wait:.0f}秒")
+        pre_wait = max(0.0, wait - CLAIM_PREWARM_LEAD_SECONDS)
+        if pre_wait > 0:
+            await asyncio.sleep(pre_wait)
+            # 避开整点洪峰，提前数秒刷新资格并温热 TLS 连接；预热失败仍保留初始资格按时直发
+            try:
+                activity = await self.fetch_state()
+            except ValueError as exc:
+                self.tlog(f"开场前状态预热失败，沿用初始资格直发: {exc}")
+            else:
+                sign_info = activity.get("signInInfo") or {}
+                nodes = sign_info.get("rewardNodes") or []
+                if not any(node.get("status") == "CLAIMABLE" for node in nodes):
+                    return activity, False
+                session = sign_info.get("signInRewardSession") or {}
+                if session.get("disabled") is False:
+                    return activity, True
+        remain_wait = min(
+            max(0.0, (target - datetime.now()).total_seconds()),
+            max(0.0, wait - pre_wait),
+        )
+        await asyncio.sleep(remain_wait + CLAIM_OPEN_BUFFER_SECONDS)
+        return activity, True
+
+    async def claim_rewards(self, activity, *, window_opened=False):
+        """仅在场次明确可领（或刚跨越整点放券窗口）时补领；业务码 200 不代表发券成功。"""
+        self._claim_dirty = False
         sign_info = activity.get("signInInfo") or {}
         nodes = sign_info.get("rewardNodes") or []
         claimable = [node for node in nodes if node.get("status") == "CLAIMABLE"]
@@ -241,52 +302,111 @@ class ShangduTask(Task):
             self.tlog("当月签到节点券已领取或尚未达标，无需提交")
             return activity
         session = sign_info.get("signInRewardSession") or {}
-        if session.get("disabled") is not False:
+        if not window_opened and session.get("disabled") is not False:
             self.tlog(
                 "签到节点奖励暂不可领: "
                 f"{session.get('displayText') or session.get('status') or '场次状态未知'}，"
                 "保留领取资格"
             )
             return activity
-        attempted = set()
+        # 按天数降序（14 → 7）优先提交高价值节点；多节点同场可领时按轮次交替重试 BUSY，
+        # 避免 14 天节点连续 10s 锁超时耗尽 7 天节点的整点放券窗口。
+        pending_days: list[int] = []
         for node in claimable:
             day = require_int(node.get("day"), "shangdu.reward.day", minimum=1)
-            if day not in REWARD_DAYS or day in attempted:
-                continue
-            attempted.add(day)
-            response = await self.api(
-                "POST", f"/monthlyRecharge/signIn/reward/{day}/claim"
-            )
-            if not self.api_ok(response):
-                self.tlog(f"{day} 天节点领取失败: {self.api_msg(response)}")
-                return activity
-            receipt = response["data"].get("data")
-            status = receipt.get("status") if isinstance(receipt, dict) else None
-            if status == "SESSION_EXHAUSTED":
-                self.tlog(
-                    f"{day} 天节点本场已领完（SESSION_EXHAUSTED），本轮不重试该节点"
+            if day in REWARD_DAYS and day not in pending_days:
+                pending_days.append(day)
+        pending_days.sort(reverse=True)
+        if not pending_days:
+            self.tlog("当月签到节点券已领取或尚未达标，无需提交")
+            return activity
+        pending_verify: list[tuple[int, object]] = []
+        sent_claim = False
+        abort_remaining = False
+        for retry in range(CLAIM_BUSY_RETRIES + 1):
+            if not pending_days or abort_remaining:
+                break
+            if retry > 0:
+                await asyncio.sleep(CLAIM_BUSY_WAIT_SECONDS)
+            next_days: list[int] = []
+            for day in pending_days:
+                response = await self.api(
+                    "POST", f"/monthlyRecharge/signIn/reward/{day}/claim"
                 )
-                continue
-            # 领取结果由读回的节点状态确认，不凭 HTTP/业务码宣告发券成功。
+                sent_claim = True
+                if not self.api_ok(response):
+                    msg = self.api_msg(response)
+                    if (
+                        response.get("code") == 200
+                        and not response.get("error")
+                        and retry < CLAIM_BUSY_RETRIES
+                        and any(
+                            k in msg
+                            for k in ("未开始", "暂未", "倒计时", "繁忙", "稍后")
+                        )
+                    ):
+                        self.tlog(
+                            f"{day} 天节点场次切换/繁忙({msg})，"
+                            f"重试 {retry + 1}/{CLAIM_BUSY_RETRIES}"
+                        )
+                        next_days.append(day)
+                        continue
+                    self.tlog(f"{day} 天节点领取失败: {msg}")
+                    abort_remaining = True
+                    break
+                receipt = response["data"].get("data")
+                status = receipt.get("status") if isinstance(receipt, dict) else None
+                if status in ("SESSION_EXHAUSTED", "EXHAUSTED"):
+                    self.tlog(f"{day} 天节点本场已领完（{status}），本轮不重试该节点")
+                    continue
+                if status in ("BUSY", "NOT_STARTED"):
+                    if retry < CLAIM_BUSY_RETRIES:
+                        self.tlog(
+                            f"{day} 天节点系统繁忙({status})，"
+                            f"重试 {retry + 1}/{CLAIM_BUSY_RETRIES}"
+                        )
+                        next_days.append(day)
+                        continue
+                    pending_verify.append((day, status))
+                    continue
+                if status == "CLAIMED":
+                    pending_verify.append((day, status))
+                    continue
+                # 未知回执状态：不继续提交后续节点，统一读回状态核实
+                pending_verify.append((day, status))
+                abort_remaining = True
+                break
+            pending_days = next_days
+
+        if pending_verify:
+            pending_verify.sort(key=lambda item: item[0], reverse=True)
+            # 领取结果统一由读回的节点状态确认，不凭 HTTP/业务码宣告发券成功。
             activity = await self.fetch_state()
             current = activity.get("signInInfo") or {}
-            state = next(
-                (
-                    n.get("status")
-                    for n in current.get("rewardNodes", [])
-                    if str(n.get("day")) == str(day)
-                ),
-                None,
-            )
-            if state != "CLAIMED":
-                self.tlog(
-                    f"{day} 天节点领取待确认: 返回状态={status} 节点状态={state}，不重试"
+            current_nodes = current.get("rewardNodes") or []
+            for day, status in pending_verify:
+                state = next(
+                    (
+                        n.get("status")
+                        for n in current_nodes
+                        if str(n.get("day")) == str(day)
+                    ),
+                    None,
                 )
-                return activity
-            self.tlog(f"{day} 天节点奖励领取成功，已读回 CLAIMED 状态")
-            session = current.get("signInRewardSession") or {}
-            if session.get("disabled") is not False:
-                return activity
+                if state == "CLAIMED":
+                    self.tlog(f"{day} 天节点奖励领取成功，已读回 CLAIMED 状态")
+                elif state == "EXHAUSTED":
+                    self.tlog(f"{day} 天节点今日已领完（EXHAUSTED），本轮不重试该节点")
+                elif status in ("BUSY", "NOT_STARTED") and state == "CLAIMABLE":
+                    self.tlog(
+                        f"{day} 天节点系统繁忙({status})未领到，节点状态={state}，不再重试该节点"
+                    )
+                else:
+                    self.tlog(
+                        f"{day} 天节点领取待确认: 返回状态={status} 节点状态={state}，不重试"
+                    )
+        else:
+            self._claim_dirty = sent_claim
         return activity
 
     async def execute(self, *, claim_only=False):
@@ -299,7 +419,8 @@ class ShangduTask(Task):
             self.tlog("当前账号不符合活动参与条件或资格未知，跳过")
             return
         if claim_only:
-            await self.claim_rewards(activity)
+            activity, window_opened = await self.wait_until_claim_session(activity)
+            await self.claim_rewards(activity, window_opened=window_opened)
             return
         sign_info = activity.get("signInInfo") or {}
         self.tlog(
@@ -310,27 +431,45 @@ class ShangduTask(Task):
         status = require_int(
             sign_info.get("status"), "shangdu.signIn.status", minimum=0
         )
+        sign_count = safe_int(sign_info.get("signInCount"), 0)
+        cap_reached = False
+        signed_attempted = False
         if status == 1:
-            self.tlog(f"今日已签到(累计{sign_info.get('signInCount', 0)}天)")
+            self.tlog(f"今日已签到(累计{sign_count}天)")
+        elif status == 0 and sign_count >= MONTHLY_SIGN_CAP:
+            cap_reached = True
+            self.tlog(f"当月签到已满(累计{sign_count}天)，跳过签到")
         elif status == 0:
+            signed_attempted = True
             response = await self.api("POST", "/monthlyRecharge/signIn")
             await self.click_log("SIGN_CLICK", "签到点击", "signIn", "A")
             if not self.api_ok(response):
-                self.tlog(f"签到失败或结果不确定: {self.api_msg(response)}，停止本轮")
-                return
+                msg = self.api_msg(response)
+                # 当月累计满 14 天后服务端返回“当月签到次数已达上线”，仍需继续执行领券与抽奖
+                if any(k in msg for k in ("已达上线", "已达上限")):
+                    cap_reached = True
+                    self.tlog(f"当月签到已满(累计{sign_count}天): {msg}")
+                else:
+                    self.tlog(f"签到失败或结果不确定: {msg}，停止本轮")
+                    return
         else:
             self.tlog(f"签到状态未知: {status}，停止本轮")
             return
-        # 签到后刷新节点与场次；查询失败时不能沿用旧次数继续提交。
-        activity = await self.fetch_state()
-        if status == 0:
+        # 发起过签到或存在待抽奖次数时刷新状态；查询失败时不能沿用旧次数继续提交。
+        initial_remain = safe_int(
+            (activity.get("lotteryInfo") or {}).get("remainCount"), 0
+        )
+        if signed_attempted or initial_remain > 0:
+            activity = await self.fetch_state()
+        if signed_attempted and not cap_reached:
             current_sign = activity.get("signInInfo") or {}
             if current_sign.get("status") != 1:
                 self.tlog("签到状态尚未确认，停止本轮，不重复提交")
                 return
             self.tlog("签到成功，已读回今日签到状态")
         activity = await self.claim_rewards(activity)
-        activity = await self.fetch_state()
+        if self._claim_dirty:
+            activity = await self.fetch_state()
         lottery_info = activity.get("lotteryInfo") or {}
         remain = require_int(
             lottery_info.get("remainCount"), "shangdu.remainCount", minimum=0

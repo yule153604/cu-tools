@@ -10,7 +10,7 @@ import httpx
 
 from cu_tasks.config import Settings
 from cu_tasks.session import Account
-from cu_tasks.tasks.welfare import WelfareTask
+from cu_tasks.tasks.welfare import DRAW_INTERVAL_SECONDS, WelfareTask
 
 
 def success(data):
@@ -136,6 +136,8 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["reqSeq"], second["reqSeq"])
         self.assertTrue(all(p == first for _, p in self.calls[3:8]))
         self.assertTrue(all(p == second for _, p in self.calls[9:]))
+        self.assertEqual(self.messages.count("抽奖结果: 未中奖"), 2)
+        self.assertFalse(any("暂无中奖信息" in m for m in self.messages))
 
     async def test_poll_failure_stops_without_another_draw(self):
         self.initial("2")
@@ -160,6 +162,7 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.responses)
         self.assertEqual([a for a, _ in self.calls].count("luckyDraw"), 1)
         self.assertEqual(self.calls[-1][0], "findWinInfo")
+        self.assertTrue(any("暂无中奖信息" in m for m in self.messages))
 
     async def test_zero_count_does_not_draw(self):
         self.initial("0")
@@ -296,6 +299,9 @@ class WelfareTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_draw_interval_matches_har_cooldown(self):
+        self.assertEqual(DRAW_INTERVAL_SECONDS, 12)
+
     def test_invalid_limits_and_empty_ids(self):
         for name, value in (
             ("UNICOM_WELFARE_MAX_DRAWS", "-1"),

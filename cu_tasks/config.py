@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 WELFARE_DRAW_HARD_LIMIT = 10
-TASK_CONCURRENCY_HARD_LIMIT = 9
+TASK_CONCURRENCY_HARD_LIMIT = 10
 
 
 def read_int(env, name, default, minimum=None, maximum=None):
@@ -39,11 +39,16 @@ class Settings:
     only_tasks: str = ""
     skip_tasks: str = ""
     # 同一账号内并发执行的活动数；1 为严格按注册顺序串行
-    task_concurrency: int = 3
+    task_concurrency: int = 4
 
     welfare_activity_id: str = "AC20260920094443"
     welfare_source: str = "ZXGS97000020362"
     welfare_max_draws: int = 3
+
+    slot_activity_id: str = "AC20261111142835"
+    slot_source: str = "ZXGS97000020415"
+    slot_max_draws: int = 3
+    slot_max_cost: int = 10
 
     farm_garbage_wait: int = 28
     farm_max_charge_per_land: int = 20
@@ -55,6 +60,8 @@ class Settings:
     # None 表示按活动规则（普通日 1 / 节气日 2），用户值只能进一步收紧
     shangdu_lottery_max: int | None = None
     uphone_lottery_cost: int = 100
+    uphone_activity_id: str = "HD2026092100322"
+    uphone_channel_id: str = "ST-JGQ"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -81,6 +88,20 @@ class Settings:
                 minimum=0,
                 maximum=WELFARE_DRAW_HARD_LIMIT,
             ),
+            slot_activity_id=read_str(
+                env, "UNICOM_SLOT_ACTIVITY_ID", d.slot_activity_id
+            ),
+            slot_source=read_str(env, "UNICOM_SLOT_FROM", d.slot_source),
+            slot_max_draws=read_int(
+                env,
+                "UNICOM_SLOT_MAX_DRAWS",
+                d.slot_max_draws,
+                minimum=0,
+                maximum=WELFARE_DRAW_HARD_LIMIT,
+            ),
+            slot_max_cost=read_int(
+                env, "UNICOM_SLOT_MAX_COST", d.slot_max_cost, minimum=0
+            ),
             farm_garbage_wait=read_int(
                 env, "UNICOM_TTXC_GARBAGE_WAIT", d.farm_garbage_wait, minimum=0
             ),
@@ -104,5 +125,11 @@ class Settings:
             ),
             uphone_lottery_cost=read_int(
                 env, "UNICOM_UPHONE_LOTTERY_COST", d.uphone_lottery_cost, minimum=1
+            ),
+            uphone_activity_id=read_str(
+                env, "UNICOM_UPHONE_ACTIVITY_ID", d.uphone_activity_id
+            ),
+            uphone_channel_id=read_str(
+                env, "UNICOM_UPHONE_CHANNEL_ID", d.uphone_channel_id
             ),
         )

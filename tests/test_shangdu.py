@@ -2,6 +2,7 @@
 
 import copy
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from cu_tasks.session import Account
@@ -17,12 +18,12 @@ def ok(data=None):
     return {"code": 200, "data": {"code": 200, "msg": "操作成功", "data": data}}
 
 
-def activity(sign=1, remain=0, disabled=True, nodes=None, festival=False):
+def activity(sign=1, remain=0, disabled=True, nodes=None, festival=False, count=None):
     return {
         "isTargetUser": True,
         "signInInfo": {
             "status": sign,
-            "signInCount": 14,
+            "signInCount": (14 if sign == 1 else 6) if count is None else count,
             "rewardNodes": nodes or [],
             "signInRewardSession": {
                 "status": "NOT_STARTED" if disabled else "ISSUING",
@@ -51,6 +52,9 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
         sleep = patch("cu_tasks.tasks.shangdu.asyncio.sleep", new=AsyncMock())
         sleep.start()
         self.addCleanup(sleep.stop)
+        wait_limit = patch("cu_tasks.tasks.shangdu.CLAIM_WAIT_MAX_SECONDS", 0)
+        wait_limit.start()
+        self.addCleanup(wait_limit.stop)
         self.calls = []
 
     def mock_api(self, responses):
@@ -69,12 +73,11 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
         self.task.login = AsyncMock(return_value=True)
         self.task.click_log = AsyncMock()
 
-    def task_responses(self, initial, refreshed=None, final=None):
+    def task_responses(self, initial, refreshed=None):
         return [
             ("GET", "/monthlyRecharge/init", ok(initial)),
             ("GET", "/monthlyRecharge/rollingText", ok([])),
             ("GET", "/monthlyRecharge/init", ok(refreshed or initial)),
-            ("GET", "/monthlyRecharge/init", ok(final or refreshed or initial)),
         ]
 
     async def test_applet_login_uses_current_ticket_and_authorization(self):
@@ -137,12 +140,12 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     "POST",
-                    "/monthlyRecharge/signIn/reward/7/claim",
+                    "/monthlyRecharge/signIn/reward/14/claim",
                     {"code": 200, "data": decoded},
                 ),
                 (
                     "POST",
-                    "/monthlyRecharge/signIn/reward/14/claim",
+                    "/monthlyRecharge/signIn/reward/7/claim",
                     {"code": 200, "data": decoded},
                 ),
             ]
@@ -221,7 +224,7 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     "POST",
-                    "/monthlyRecharge/signIn/reward/7/claim",
+                    "/monthlyRecharge/signIn/reward/14/claim",
                     ok({"status": "UNKNOWN"}),
                 ),
                 ("GET", "/monthlyRecharge/init", ok(current)),
@@ -258,7 +261,6 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
                     "/monthlyRecharge/signIn/reward/7/claim",
                     ok({"status": "CLAIMED"}),
                 ),
-                ("GET", "/monthlyRecharge/init", ok(claimed)),
                 ("GET", "/monthlyRecharge/init", ok(claimed)),
             ]
         )
@@ -336,3 +338,262 @@ class ShangduTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.task.api.await_args.kwargs["params"]["eventType"], "CLICK"
         )
+
+    async def test_prewarm_claim_waits_for_top_of_hour_then_claims(self):
+        sleep_mock = AsyncMock()
+        self.mock_api(
+            [
+                # 08:59:10 初始查询
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(disabled=True, nodes=[node(7)])),
+                ),
+                # 08:59:54 开场前预热连接并刷新资格（避开 09:00 洪峰）
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(disabled=True, nodes=[node(7)])),
+                ),
+                # 09:00:00 直接提交抢券，不再被慢 init 阻塞
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/7/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(nodes=[node(7, "CLAIMED")])),
+                ),
+            ]
+        )
+        with (
+            patch("cu_tasks.tasks.shangdu.CLAIM_WAIT_MAX_SECONDS", 180),
+            patch("cu_tasks.tasks.shangdu.asyncio.sleep", new=sleep_mock),
+            patch("cu_tasks.tasks.shangdu.datetime") as dt,
+        ):
+            dt.now.return_value = datetime(2026, 11, 16, 8, 59, 10)
+            await self.task.execute(claim_only=True)
+        self.assertFalse(self.responses)
+        sleeps = [round(c.args[0], 2) for c in sleep_mock.await_args_list]
+        self.assertEqual(sleeps, [44.0, 6.02])
+        self.assertTrue(any("等待 09:00 放券场次开放 50秒" in m for m in self.messages))
+        self.assertTrue(any("已读回 CLAIMED" in m for m in self.messages))
+
+    async def test_prewarm_claim_skips_wait_without_claimable_node(self):
+        self.mock_api(
+            [
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(disabled=True, nodes=[node(7, "CLAIMED")])),
+                ),
+            ]
+        )
+        with (
+            patch("cu_tasks.tasks.shangdu.CLAIM_WAIT_MAX_SECONDS", 180),
+            patch("cu_tasks.tasks.shangdu.datetime") as dt,
+        ):
+            dt.now.return_value = datetime(2026, 11, 16, 8, 59, 10)
+            await self.task.execute(claim_only=True)
+        self.assertFalse(self.responses)
+        self.assertFalse(any("等待" in m for m in self.messages))
+        self.assertTrue(any("无需提交" in m for m in self.messages))
+
+    async def test_monthly_sign_cap_skips_sign_post_and_continues_to_festival_lottery(
+        self,
+    ):
+        initial = activity(sign=0, remain=1, festival=True, count=14)
+        after_draw = activity(sign=0, remain=0, festival=True, count=14)
+        self.mock_api(
+            [
+                ("GET", "/monthlyRecharge/init", ok(initial)),
+                ("GET", "/monthlyRecharge/rollingText", ok([])),
+                ("GET", "/monthlyRecharge/init", ok(initial)),
+                ("POST", "/monthlyRecharge/lottery", ok(0)),
+                ("GET", "/monthlyRecharge/init", ok(after_draw)),
+            ]
+        )
+        await self.task.execute()
+        self.assertFalse(self.responses)
+        self.task.click_log.assert_awaited_once_with(
+            "LOTTERY_CLICK", "抽奖点击", "lottery", "C"
+        )
+        self.assertTrue(any("当月签到已满" in m for m in self.messages))
+        self.assertTrue(any("30元话费券" in m for m in self.messages))
+        self.assertFalse(any("失败" in m for m in self.messages))
+
+    async def test_busy_claim_retries_when_still_claimable_and_succeeds(self):
+        still_open = activity(disabled=False, nodes=[node(14)])
+        claimed = activity(disabled=False, nodes=[node(14, "CLAIMED")])
+        self.mock_api(
+            [
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "BUSY"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                ("GET", "/monthlyRecharge/init", ok(claimed)),
+            ]
+        )
+        await self.task.claim_rewards(still_open)
+        self.assertFalse(self.responses)
+        self.assertTrue(any("重试 1/" in m for m in self.messages))
+        self.assertTrue(any("已读回 CLAIMED" in m for m in self.messages))
+
+    async def test_busy_claim_round_robins_other_node_before_retrying_and_init(self):
+        open_both = activity(disabled=False, nodes=[node(7), node(14)])
+        second_claimed = activity(disabled=True, nodes=[node(7, "CLAIMED"), node(14)])
+        self.mock_api(
+            [
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "BUSY"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/7/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "BUSY"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "BUSY"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "BUSY"}),
+                ),
+                ("GET", "/monthlyRecharge/init", ok(second_claimed)),
+            ]
+        )
+        await self.task.claim_rewards(open_both)
+        self.assertFalse(self.responses)
+        self.assertTrue(
+            any("14 天节点系统繁忙(BUSY)未领到" in m for m in self.messages)
+        )
+        self.assertTrue(any("7 天节点奖励领取成功" in m for m in self.messages))
+
+    async def test_prewarm_failure_keeps_initial_state_and_still_claims_at_top_of_hour(
+        self,
+    ):
+        sleep_mock = AsyncMock()
+        self.mock_api(
+            [
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(disabled=True, nodes=[node(14)])),
+                ),
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    {"code": 502, "data": None},
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                (
+                    "GET",
+                    "/monthlyRecharge/init",
+                    ok(activity(nodes=[node(14, "CLAIMED")])),
+                ),
+            ]
+        )
+        with (
+            patch("cu_tasks.tasks.shangdu.CLAIM_WAIT_MAX_SECONDS", 180),
+            patch("cu_tasks.tasks.shangdu.asyncio.sleep", new=sleep_mock),
+            patch("cu_tasks.tasks.shangdu.datetime") as dt,
+        ):
+            dt.now.return_value = datetime(2026, 11, 18, 10, 59, 10)
+            await self.task.execute(claim_only=True)
+        self.assertFalse(self.responses)
+        self.assertTrue(any("沿用初始资格直发" in m for m in self.messages))
+        self.assertTrue(any("14 天节点奖励领取成功" in m for m in self.messages))
+
+    async def test_both_claimable_nodes_submit_14_then_7_before_single_read_back(self):
+        open_both = activity(disabled=False, nodes=[node(7), node(14)])
+        both_claimed = activity(
+            disabled=True, nodes=[node(7, "CLAIMED"), node(14, "CLAIMED")]
+        )
+        self.mock_api(
+            [
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/7/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                ("GET", "/monthlyRecharge/init", ok(both_claimed)),
+            ]
+        )
+        await self.task.claim_rewards(open_both)
+        self.assertFalse(self.responses)
+        self.assertTrue(any("14 天节点奖励领取成功" in m for m in self.messages))
+        self.assertTrue(any("7 天节点奖励领取成功" in m for m in self.messages))
+
+    async def test_exhausted_receipt_at_final_session_moves_to_next_node(self):
+        open_both = activity(disabled=False, nodes=[node(7), node(14)])
+        second_claimed = activity(
+            disabled=True, nodes=[node(7, "CLAIMED"), node(14, "EXHAUSTED")]
+        )
+        self.mock_api(
+            [
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "EXHAUSTED"}),
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/7/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                ("GET", "/monthlyRecharge/init", ok(second_claimed)),
+            ]
+        )
+        await self.task.claim_rewards(open_both)
+        self.assertFalse(self.responses)
+        self.assertTrue(any("7 天节点奖励领取成功" in m for m in self.messages))
+
+    async def test_not_started_hint_at_window_edge_retries_and_reads_back_claimed(self):
+        pre_open = activity(disabled=True, nodes=[node(14)])
+        claimed = activity(disabled=False, nodes=[node(14, "CLAIMED")])
+        self.mock_api(
+            [
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    {"code": 200, "data": {"code": 500, "msg": "本场活动暂未开始"}},
+                ),
+                (
+                    "POST",
+                    "/monthlyRecharge/signIn/reward/14/claim",
+                    ok({"status": "CLAIMED"}),
+                ),
+                ("GET", "/monthlyRecharge/init", ok(claimed)),
+            ]
+        )
+        await self.task.claim_rewards(pre_open, window_opened=True)
+        self.assertFalse(self.responses)
+        self.assertTrue(any("重试 1/" in m for m in self.messages))
+        self.assertTrue(any("已读回 CLAIMED" in m for m in self.messages))

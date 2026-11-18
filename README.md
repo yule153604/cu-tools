@@ -20,22 +20,23 @@ cu_tasks/
 ├── runner.py               # 调度：多账号并发、账号内任务并发、通知汇总
 └── tasks/                  # 每个活动一个 Task 子类
     ├── market.py  sign.py  welfare.py  xinjiang.py  security.py
-    └── farm.py  shangdu.py  uphone.py  woread.py
+    └── farm.py  shangdu.py  uphone.py  woread.py  slot.py
 tests/                      # 离线协议与调度回归测试
 ```
 
 ## 任务模块
 
-登录后执行以下任务。默认同一账号内最多 3 个任务并发，单个任务失败不影响其他任务。
+登录后执行以下任务。默认同一账号内最多 4 个任务并发，单个任务失败不影响其他任务。
 
 | 名称 | 标签 | 类 | 备注 |
 |------|------|----|------|
 | `market` | 权益超市 | `MarketTask` | 10 点开抢，排在最前 |
-| `sign` | 签到区 | `SignTask` | |
 | `welfare` | 福利商城九宫格 | `WelfareTask` | 抓包活动，默认每轮最多 3 次 |
+| `slot` | 福利商城好运开转 | `SlotTask` | 抓包积分抽奖，单次 10 积分，默认最多 3 次 |
+| `farm` | 通通乡村 | `FarmTask` | |
+| `sign` | 签到区 | `SignTask` | |
 | `xj` | 新疆联通 | `XinjiangTask` | 仅新疆归属地 |
 | `sec` | 安全管家 | `SecurityTask` | |
-| `farm` | 通通乡村 | `FarmTask` | |
 | `shangdu` | 商都福利 | `ShangduTask` | 仅河南归属地 |
 | `uphone` | 云手机积分 | `UphoneTask` | 见下方说明 |
 | `woread` | 沃阅读积分 | `WoreadTask` | 每账号自动换票 |
@@ -49,10 +50,17 @@ tests/                      # 离线协议与调度回归测试
 1. `findActivity` 校验活动状态与参与资格，`findLotteryCount` 查询剩余次数。
 2. 以表单 `params` 承载 JSON 调用 `luckyDraw`，每次生成独立 `reqSeq`。
 3. 等待 3 秒，以同一 `reqSeq` 调用 `findWinInfo`；返回 `isWin=false` 时每隔 1 秒再查，最多共 4 次，中奖立即停止查询，再刷新剩余次数。
-4. `findWinInfo` 的 `1123` 按未中奖处理；`luckyDraw` 的 `1129` 会查询结果及次数，确认次数已减少才允许继续下一次，否则停止。连续提交之间额外等待 30 秒，每次提交都计入本轮上限。
+4. `findWinInfo` 的 `1123`（以及次数已减少且连续查询 `isWin=false`）按未中奖处理；`luckyDraw` 的 `1129` 会查询结果及次数，确认次数已减少才允许继续下一次，否则停止。连续提交之间额外等待 12 秒，每次提交都计入本轮上限。
 5. 次数为零、次数未减少、未知响应时停止。超时或未知业务失败后仅进行上述有上限的结果查询并停止，不重发原抽奖请求。
 
 新抓包返回 `luckType=0`、`consumptionIntegral=""`，初始剩余 3 次；空配置不能据此认定次数免费，以活动页面实际积分规则为准。默认每轮最多提交 3 次，`UNICOM_WELFARE_MAX_DRAWS` 可设为 0–10（0 跳过）。此上限是单次运行上限，不是跨进程的每日限制。活动更换时可覆盖活动 ID 与渠道，不需要修改业务代码。状态不在已验证范围内时跳过。
+
+### 福利商城好运开转（`slot`）
+
+依据 2026-11-16 抓包新增福利商城顶部横幅「11.11积分狂欢·好运开转」老虎机抽奖活动，默认活动 `AC20261111142835`，渠道 `ZXGS97000020415`，复用 `ninePalaceGrid` 接口协议（`luckType=1`、`consumptionIntegral=10`，初始剩余 3 次）。
+
+- 启动前校验单次消耗积分不超过 `UNICOM_SLOT_MAX_COST`（默认 10，`luckType=1` 且消耗配置缺失时跳过）；设为 `0` 或将 `UNICOM_SLOT_MAX_DRAWS` 设为 `0` 可跳过消耗积分抽奖。
+- `luckyDraw` 返回 `1126`（积分不足）或 `1124`（非目标用户）时立即停止，不再查询中奖结果；`1129` 繁忙响应与结果轮询规则同 `welfare`。
 
 复用在线登录后的当前账号 Cookie，不读取 HAR，也不固定抓包中的账号、设备 ID 或请求编号。新活动业务分支通过脱敏响应及模拟 HTTP 回归测试；2026-10-31 已更新服务器凭证，4 个不同账号均登录成功，并完成新活动状态与次数的只读验证。凭证失效时需重新登录并更新青龙的 `chinaUnicomCookie`，多个 `token_online` 用 `@` 分隔；登录失败日志会显示接口的 `dsc` 原因。
 
@@ -60,9 +68,9 @@ tests/                      # 离线协议与调度回归测试
 
 依据 2026-10-31 小程序抓包，使用当前账号的 `ecs_token`，经 `getTicketByNative`（`edop_unicom_4b80047a`）换票，再调用 `loginAppAppletFree` 获取当前账号授权；请求使用 `X-Client-Type: APPLET`。
 
-签到节点券每天 **09:00、11:00、15:00、19:00** 放出。每个账号每月 **2 元券、5 元券各限领取 1 张**，对应累计签到 7 天、14 天的节点；以服务端当月节点状态判断是否已领取，仅对 `CLAIMABLE` 且当前场次 `disabled=false` 的节点提交一次。领取后读回 `CLAIMED` 才记录成功；`SESSION_EXHAUSTED` 表示本场已领完，不能把业务码 200 当成领取成功。签到后先刷新节点，避免使用签到前的旧资格。
+签到节点券每天 **09:00、11:00、15:00、19:00** 放出。每个账号每月 **2 元券、5 元券各限领取 1 张**，对应累计签到 7 天、14 天的节点；以服务端当月节点状态判断是否已领取，按 **14 → 7 天**顺序优先提交高面额节点，日常入口仅对 `CLAIMABLE` 且当前场次 `disabled=false` 的节点提交，专用放券入口在开场前 6 秒预热连接并在整点直发提交。`BUSY` 回执在可领节点间按轮次有界短退避交替重试（避免高面额节点锁超时阻塞低面额节点），`SESSION_EXHAUSTED` / `EXHAUSTED` 表示本场或当日已领完并继续尝试下一可领节点；本轮可领节点提交完毕后统一读回 `CLAIMED` 才记录成功，不能把业务码 200 当成领取成功。签到后先刷新节点，避免使用签到前的旧资格。
 
-青龙商都领取专用任务使用 `task shangdu_claim.py`，cron 为 `0 9,11,15,19 * * *`（北京时间）。此入口只领取节点券；日常签到、抽奖仍由主任务负责。旧的凌晨领取任务已替换。正常日每轮最多抽奖 1 次，节气回馈日最多 2 次，用户配置只能进一步降低上限；状态查询失败、次数不下降或提交结果不确定时停止。
+青龙商都领取专用任务使用 `task shangdu_claim.py`，cron 为 `59 8,10,14,18 * * *`（北京时间，提前 1 分钟预登录并在 09/11/15/19 点整点开放后立即领取）。此入口只领取节点券；日常签到、抽奖仍由主任务负责。旧的凌晨领取任务已替换。正常日每轮最多抽奖 1 次，节气回馈日最多 2 次，用户配置只能进一步降低上限；状态查询失败、次数不下降或提交结果不确定时停止。
 
 ### 云手机（`uphone`）
 
@@ -73,7 +81,7 @@ tests/                      # 离线协议与调度回归测试
 3. **活动登录** + **积分签到**（`Points_Sign_2507`）
 4. **赚积分任务**（`Points_Obtain_2507`）：可 API 完成的任务自动上报并领取；讨论区、看广告等需真机行为的任务跳过
 5. **积分十连**：余额 ≥ 阈值且当日仍有次数时执行（默认满 100 分）
-6. **夏日刮一刮**（`HD2026062200218`）：仅领 `2508-01` 换 1 次次数，有次数则抽完
+6. **冬日岁末福利站**（`HD2026092100322`）：包月会员额外领 `011-2`，日常任务优先领 `2508-01` 换 1 次翻雪花次数，有次数则抽完（奖品自动充值到账）
 
 ## 快速开始
 
@@ -116,12 +124,16 @@ python cu.py
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `UNICOM_ONLY_TASK` | 全部任务 | `market,sign,welfare,xj,sec,farm,shangdu,uphone,woread` 中的任务 |
+| `UNICOM_ONLY_TASK` | 全部任务 | `market,sign,welfare,xj,sec,farm,shangdu,uphone,woread,slot` 中的任务 |
 | `UNICOM_SKIP_TASK` | 空 | 逗号分隔的排除任务 |
-| `UNICOM_TASK_CONCURRENCY` | `3` | 同一账号内并发任务数，1–9；设为 1 则按上表顺序串行 |
+| `UNICOM_TASK_CONCURRENCY` | `4` | 同一账号内并发任务数，1–10；设为 1 则按上表顺序串行 |
 | `UNICOM_WELFARE_ACTIVITY_ID` | `AC20260920094443` | 九宫格活动 ID |
 | `UNICOM_WELFARE_FROM` | `ZXGS97000020362` | 九宫格渠道 |
 | `UNICOM_WELFARE_MAX_DRAWS` | `3` | 每轮最多抽奖次数，0–10 |
+| `UNICOM_SLOT_ACTIVITY_ID` | `AC20261111142835` | 好运开转（老虎机）活动 ID |
+| `UNICOM_SLOT_FROM` | `ZXGS97000020415` | 好运开转渠道 |
+| `UNICOM_SLOT_MAX_DRAWS` | `3` | 好运开转每轮最多抽奖次数，0–10 |
+| `UNICOM_SLOT_MAX_COST` | `10` | 好运开转单次允许消耗的最大积分，超过则跳过 |
 | `UNICOM_MARKET_WAIT_MAX` | `300` | 权益超市开抢前最多等待秒数，超过则跳过 |
 | `UNICOM_MARKET_API_RETRIES` | `3` | 权益超市查询接口网络/5xx 重试次数 |
 | `UNICOM_TTXC_GARBAGE_WAIT` | `28` | 农场垃圾任务等待秒数 |
@@ -129,10 +141,12 @@ python cu.py
 | `UNICOM_TTXC_HARVEST_WAIT` | `3` | 收获等待秒数 |
 | `SHANGDU_LOTTERY_MAX` | 普通日 1 / 节气日 2 | 每轮抽奖上限，只能进一步降低 |
 | `UNICOM_UPHONE_LOTTERY_COST` | `100` | 云手机积分十连触发余额阈值 |
+| `UNICOM_UPHONE_ACTIVITY_ID` | `HD2026092100322` | 云手机冬日岁末福利站活动 ID |
+| `UNICOM_UPHONE_CHANNEL_ID` | `ST-JGQ` | 云手机冬日活动登录渠道 |
 
 ## 说明
 
-- 默认关闭 HTTP/2，使用 HTTP/1.1；连接超时 15 秒，读取超时 50 秒
+- 默认关闭 HTTP/2，使用 HTTP/1.1（连接池保活 45 秒）；连接超时 15 秒，读取超时 50 秒
 - 日志中对手机号、token、ticket 等敏感信息做脱敏处理
 - 请勿将 token、密钥等敏感信息提交到公开仓库
 
@@ -158,4 +172,4 @@ python -m ruff format --check .
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖九宫格与商都协议、次数边界、活动资格，以及配置校验、任务选择、并发上限、Cookie 隔离、异常隔离、归属地过滤，和取消时的连接释放。
+测试覆盖九宫格、好运开转与商都协议、次数与积分消耗边界、活动资格，以及配置校验、任务选择、并发上限、Cookie 隔离、异常隔离、归属地过滤，和取消时的连接释放。

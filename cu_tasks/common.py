@@ -1,5 +1,6 @@
 """与具体活动无关的工具函数：整数校验、响应摘要、日志脱敏、Cookie 解析。"""
 
+import base64
 import os
 import re
 import traceback
@@ -34,33 +35,75 @@ def safe_int(value, default=0):
 
 
 _REDACT_FIELD_RE = re.compile(
-    r'(["\']?(token|ticket|cookie|verifycode|accesstoken|tokenid|authinfo|sessionid|'
-    r'authorization|access[-_]?token|secret)["\']?\s*[:=]\s*)(["\']?)[^"\',}&\s]+\3',
+    r'(["\']?[\w-]*?(?:token|ticket|cookie|verifycode|authinfo|sessionid|'
+    r'authorization|secret|password|passwd)[\w-]*?["\']?\s*[:=]\s*(?:Bearer\s+)?)'
+    r'(?:(["\'])(?!\2)[^"\']*(?:\2|$)|[^"\',}&\s]+)',
     re.IGNORECASE,
 )
-_MOBILE_RE = re.compile(r"(?<!\w)1[3-9]\d{9}(?!\w)")
+_BEARER_RE = re.compile(r"\b(Bearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+_MOBILE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\+?86[-\s]?)?(?<!\*{3})(1[3-9]\d{9})"
+    r"(?:(?![A-Za-z0-9])|(?=\d{10,}(?![A-Za-z0-9])))"
+)
+_ORDER_MOBILE_PREFIX_RE = re.compile(
+    r"^([A-Za-z]{0,8}?)(?:\+?86)?(?<!\*{3})(1[3-9]\d{9})(\d{4,})$"
+)
 
 
-def redact_text(text):
-    """JSON/表单风格文本中的凭据字段与手机号打码（认证材料不入持久日志）。"""
-    return _MOBILE_RE.sub("***", _REDACT_FIELD_RE.sub(r"\1\3***\3", str(text)))
+def _redact_field_match(match: re.Match) -> str:
+    quote = match.group(2) or ""
+    return f"{match.group(1)}{quote}***{quote}"
 
 
 def mask_mobile(mobile):
-    return f"{mobile[:3]}****{mobile[-4:]}" if mobile else "未知号码"
+    if not mobile:
+        return "未知号码"
+    s = str(mobile)
+    return f"{s[:3]}****{s[-4:]}" if len(s) >= 7 else "***"
 
 
-def response_summary(res):
+def redact_text(text, mobile: str = ""):
+    """JSON/表单风格文本中的凭据字段、Bearer 令牌与手机号打码。"""
+    redacted = str(text)
+    redacted = _BEARER_RE.sub(r"\1***", redacted)
+    redacted = _REDACT_FIELD_RE.sub(_redact_field_match, redacted)
+    if mobile and len(mobile) >= 7:
+        redacted = redacted.replace(mobile, mask_mobile(mobile))
+        if len(mobile) >= 11:
+            b64 = base64.b64encode(mobile.encode()).decode()
+            redacted = redacted.replace(b64, "***")
+            b64_nopad = b64.rstrip("=")
+            if b64_nopad != b64:
+                redacted = redacted.replace(b64_nopad, "***")
+    return _MOBILE_RE.sub("***", redacted)
+
+
+def redact_order_id(order_id, mobile: str = "") -> str:
+    """订单号脱敏：遮蔽已知手机号子串或内嵌手机号前缀，保留订单尾号定位。"""
+    if order_id is None:
+        return ""
+    s = str(order_id).strip()
+    if not s:
+        return ""
+    if mobile and len(mobile) >= 7 and mobile in s:
+        s = s.replace(mobile, mask_mobile(mobile))
+    m = _ORDER_MOBILE_PREFIX_RE.match(s)
+    if m:
+        s = f"{m.group(1)}{mask_mobile(m.group(2))}{m.group(3)}"
+    return redact_text(s, mobile=mobile)
+
+
+def response_summary(res, *, mobile: str = ""):
     if isinstance(res, dict):
         meta = res.get("meta") or {}
         if isinstance(meta, dict) and meta.get("message"):
-            return redact_text(meta.get("message"))
+            return redact_text(meta.get("message"), mobile=mobile)
         if res.get("msg"):
-            return redact_text(res.get("msg"))
-    return redact_text(res)[:120]
+            return redact_text(res.get("msg"), mobile=mobile)
+    return redact_text(res, mobile=mobile)[:120]
 
 
-def format_exception_detail(e, action=None):
+def format_exception_detail(e, action=None, *, mobile: str = ""):
     parts = []
     if action:
         parts.append(f"环节={action}")
@@ -74,28 +117,28 @@ def format_exception_detail(e, action=None):
                 parts.append(f"代码={f.line.strip()}")
     if e.__cause__:
         parts.append(f"原因={type(e.__cause__).__name__}: {e.__cause__}")
-    return redact_text(" | ".join(parts))
+    return redact_text(" | ".join(parts), mobile=mobile)
 
 
-def api_response_err(r, action=None):
+def api_response_err(r, action=None, *, mobile: str = ""):
     parts = []
     if action:
         parts.append(action)
     if not r:
         parts.append("无响应")
-        return " | ".join(parts)
+        return redact_text(" | ".join(parts), mobile=mobile)
     if r.get("code") == -1:
         parts.append("网络/请求异常")
         if r.get("error"):
             parts.append(str(r["error"]))
-        return " | ".join(parts)
+        return redact_text(" | ".join(parts), mobile=mobile)
     http = r.get("code")
     if http not in (200, 201, 302):
         parts.append(f"HTTP={http}")
     if r.get("error"):
         parts.append("协议/JSON解析错误")
         parts.append(str(r["error"]))
-        return " | ".join(parts)
+        return redact_text(" | ".join(parts), mobile=mobile)
     data = r.get("data")
     if isinstance(data, dict):
         for k in (
@@ -113,14 +156,14 @@ def api_response_err(r, action=None):
             if v not in (None, "", {}):
                 parts.append(f"{k}={v}")
         if len(parts) == (1 if action else 0):
-            parts.append(f"body={redact_text(data)[:150]}")
+            parts.append(f"body={redact_text(data, mobile=mobile)[:150]}")
     elif data is not None:
         text = str(data).strip()
         if text:
-            parts.append(f"body={redact_text(text)[:150]}")
+            parts.append(f"body={redact_text(text, mobile=mobile)[:150]}")
     elif http in (200, 201):
         parts.append("响应体为空")
-    return " | ".join(parts)
+    return redact_text(" | ".join(parts), mobile=mobile)
 
 
 def require_dict_data(r, action=None):
@@ -163,9 +206,12 @@ def iter_set_cookies(headers: httpx.Headers | Mapping[str, object]):
 
 
 def find_set_cookie(headers, name):
-    """从响应头取指定 Cookie 的值；不存在返回空串。"""
-    prefix = f"{name}="
+    """从响应头取指定 Cookie 的值；精确匹配键名，不存在返回空串。"""
     for item in iter_set_cookies(headers or {}):
-        if prefix in item:
-            return item.split(prefix, 1)[1].split(";", 1)[0]
+        first_pair = item.split(";", 1)[0].strip()
+        if "=" not in first_pair:
+            continue
+        key, value = first_pair.split("=", 1)
+        if key.strip() == name:
+            return value
     return ""

@@ -20,6 +20,8 @@ from cu_tasks.common import (
 
 API = "https://backward.bol.wo.cn/prod-api"
 RETRY_BASE_SECONDS = 0.15
+PREFETCH_LEAD_SECONDS = 12.0  # 开抢前预拉窗口，配合 45s 连接池保活兼顾容错与温热连接
+STAGGER_SECONDS = 0.03
 RAFFLE_HARD_LIMIT = 10  # 服务端次数硬上限，防异常值失控
 # 领取失败文案含这些词时继续尝试下一商品
 TRY_NEXT_KEYWORDS = (
@@ -46,8 +48,10 @@ class MarketTask(Task):
 
     name, label = "market", "权益超市"
 
-    token = login_id = cycle_start_time = ""
-    prefetched_info = prefetched_act = None
+    def __init__(self, account, settings=None):
+        super().__init__(account, settings)
+        self.token = self.login_id = self.cycle_start_time = ""
+        self.prefetched_info = self.prefetched_act = None
 
     def auth_headers(self):
         return {
@@ -67,18 +71,11 @@ class MarketTask(Task):
         now = datetime.now()
         return now.hour * 60 + now.minute >= 600
 
-    async def wait_until_open(self):
-        now = datetime.now()
+    @staticmethod
+    def seconds_until_open(now: datetime | None = None) -> float:
+        now = now or datetime.now()
         start = now.replace(hour=10, minute=0, second=0, microsecond=0)
-        if now >= start:
-            return True
-        wait = (start - now).total_seconds()
-        if wait > self.settings.market_wait_max:
-            self.tlog(f"未到10点(距离开抢{wait:.0f}秒)，跳过优享权益")
-            return False
-        self.tlog(f"等待开抢 {wait:.0f}秒")
-        await asyncio.sleep(wait)
-        return True
+        return max(0.0, (start - now).total_seconds())
 
     async def req_dict(self, action, method, url, **kw):
         """权益超市请求：要求 data 为 dict；网络/5xx 短重试，失败软返回 None。"""
@@ -351,35 +348,46 @@ class MarketTask(Task):
         try:
             if not self.token:
                 return
-            # 预拉优化: 未到10点时先查会员状态, 避开开抢瞬间接口洪峰
             self.prefetched_info = None
             self.prefetched_act = None
             if not self.is_open():
+                wait = self.seconds_until_open()
+                if wait > self.settings.market_wait_max:
+                    self.tlog(f"未到10点(距离开抢{wait:.0f}秒)，跳过优享权益")
+                    return
+                self.tlog(f"等待开抢 {wait:.0f}秒")
+                pre_wait = max(0.0, wait - PREFETCH_LEAD_SECONDS)
+                if pre_wait > 0:
+                    await asyncio.sleep(pre_wait)
+                # 临近 10 点再预拉，避免过早预拉导致连接池空闲断连及库存陈旧
                 self.prefetched_info = await self.fetch_select_info()
-                if self.prefetched_info:
-                    self.tlog("优享权益: 开抢前已预拉会员状态 ✅")
+                if not self.prefetched_info:
+                    return
+                self.tlog("优享权益: 开抢前已预拉会员状态 ✅")
                 self.prefetched_act = await self.fetch_youchoice_activity()
                 if self.prefetched_act:
                     self.tlog("优享权益: 开抢前已预拉活动数据 ✅")
-            if not await self.wait_until_open():
-                return
+                remain_wait = self.seconds_until_open()
+                if remain_wait > 0:
+                    await asyncio.sleep(remain_wait)
             if not self.is_open():
                 self.tlog("优享权益: 本场活动暂未开启")
                 return
 
-            await asyncio.sleep(max(0, (self.idx - 1) * 0.15))
+            if self.idx > 1 and STAGGER_SECONDS > 0:
+                await asyncio.sleep((self.idx - 1) * STAGGER_SECONDS)
 
             if self.prefetched_info is None:
                 if not await self.fetch_select_info():
                     return
 
-            # 10点直发: 用预拉活动数据直接提交抢购(跳过查询/解锁/拦截判断)
+            # 10点直发: 用预拉活动数据直接提交抢购
             if self.prefetched_act:
                 act = self.prefetched_act
                 items = self.build_try_order(act.get("detailList") or [])
                 if items:
                     self.tlog(f"优享权益: 10点直发抢购({len(items)}个商品)")
-                    for i, item in enumerate(items):
+                    for item in items:
                         name = item.get("productName", "")
                         try:
                             res = await self.receive_rights(act, item)
@@ -390,8 +398,24 @@ class MarketTask(Task):
                         if code == 200:
                             self.tlog(f"优享权益: [{name}] 成功(10点直发)")
                             return
+                        if code == -2:
+                            self.tlog(
+                                f"优享权益: [{name}] 直发需人机验证，尝试 manMachine"
+                            )
+                            try:
+                                if not await self.man_machine(act.get("activityId")):
+                                    continue
+                                res = await self.receive_rights(act, item)
+                            except ValueError as e:
+                                self.tlog(f"优享权益: [{name}] 人机/重试失败 {e}")
+                                continue
+                            if safe_int(res.get("code"), -1) == 200:
+                                self.tlog(f"优享权益: [{name}] 成功(10点直发)")
+                                return
                         msg = str(res.get("msg", ""))
                         self.tlog(f"优享权益: [{name}] 直发失败 {msg or res}")
+                        if any(k in msg for k in STOP_KEYWORDS):
+                            return
                         if self.should_try_next(msg):
                             continue
                         break
@@ -472,15 +496,18 @@ class MarketTask(Task):
                 if code == -2:
                     self.tlog(f"优享权益: [{name}] 需人机验证，尝试 manMachine")
                     try:
-                        if await self.man_machine(act.get("activityId")):
-                            res = await self.receive_rights(act, item)
-                            if safe_int(res.get("code")) == 200:
-                                self.tlog(f"优享权益: [{name}] 成功")
-                                return
+                        if not await self.man_machine(act.get("activityId")):
+                            self.tlog(
+                                f"优享权益: [{name}] 人机验证未通过，尝试下一商品"
+                            )
+                            continue
+                        res = await self.receive_rights(act, item)
                     except ValueError as e:
                         self.tlog(f"优享权益: [{name}] 人机/重试失败 {e}")
-                    self.tlog(f"优享权益: [{name}] 人机验证后仍未成功，尝试下一商品")
-                    continue
+                        continue
+                    if safe_int(res.get("code"), -1) == 200:
+                        self.tlog(f"优享权益: [{name}] 成功")
+                        return
                 msg = str(res.get("msg", ""))
                 self.tlog(f"优享权益: [{name}] 失败 {msg or res}")
                 if self.should_try_next(msg):

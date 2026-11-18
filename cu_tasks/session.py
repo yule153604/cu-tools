@@ -1,6 +1,7 @@
 """账号会话：在线登录、连接池与日志；活动任务通过 Account 获取隔离的客户端。"""
 
 import random
+import ssl
 import string
 import uuid
 from datetime import datetime
@@ -15,6 +16,13 @@ from cu_tasks.common import (
 )
 from cu_tasks.net import new_client, request
 
+_SSL_CONTEXT = ssl.create_default_context()
+POOL_LIMITS = httpx.Limits(
+    max_connections=20,
+    max_keepalive_connections=10,
+    keepalive_expiry=45.0,
+)
+
 APP_VERSION = "iphone_c@11.0503"
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_1_2 like Mac OS X) AppleWebKit/605.1.15 "
@@ -28,9 +36,9 @@ APP_ID = (
 LOGIN_URL = "https://m.client.10010.com/mobileService/onLine.htm"
 
 
-def format_line(idx, msg, tag=None):
+def format_line(idx, msg, tag=None, *, mobile: str = ""):
     scope = f"[账号{idx}] [{tag}]" if tag else f"[账号{idx}]"
-    return f"[{datetime.now():%H:%M:%S}] {scope} {redact_text(msg)}"
+    return f"[{datetime.now():%H:%M:%S}] {scope} {redact_text(msg, mobile=mobile)}"
 
 
 class Account:
@@ -46,7 +54,9 @@ class Account:
             random.choices(string.ascii_letters + string.digits, k=32)
         )
         self.lines: list[str] = []
-        self._transport = transport or httpx.AsyncHTTPTransport(http2=False)
+        self._transport = transport or httpx.AsyncHTTPTransport(
+            http2=False, verify=_SSL_CONTEXT, limits=POOL_LIMITS
+        )
         self.client = new_client(
             self._transport, headers={"User-Agent": UA, "Connection": "keep-alive"}
         )
@@ -60,14 +70,15 @@ class Account:
 
     # --- 日志 ---
     def emit(self, line: str, sink: list[str]):
+        line = redact_text(line, mobile=self.mobile)
         print(line, flush=True)
         sink.append(line)
 
     def log(self, msg):
-        self.emit(format_line(self.idx, msg), self.lines)
+        self.emit(format_line(self.idx, msg, mobile=self.mobile), self.lines)
 
     def log_exc(self, e, action=None):
-        self.log(f"异常: {format_exception_detail(e, action)}")
+        self.log(f"异常: {format_exception_detail(e, action, mobile=self.mobile)}")
 
     # --- HTTP ---
     def new_client(self) -> httpx.AsyncClient:

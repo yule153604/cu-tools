@@ -16,7 +16,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 from cu_tasks.base import Task
-from cu_tasks.common import api_response_err, mask_mobile
+from cu_tasks.common import api_response_err, mask_mobile, safe_int
 from cu_tasks.jftask import JfTaskClient, task_pending
 
 BASE = "https://10010.woread.com.cn/ng_woread_service/rest"
@@ -44,6 +44,7 @@ BOOK = {
 #   ❌ 分享（需真实微信回调，直调假成功）/ 邀请（需真新用户）/ 会员（需付费）
 #      / 限时福利（需爱看 App）→ 跳过
 SKIP_KEYWORDS = ("邀请", "会员", "分享", "限时福利")
+READ_SYNC_WAIT_SECONDS = 3
 
 
 def aes_hex_b64(plain: str) -> str:
@@ -138,12 +139,12 @@ class WoreadTask(Task):
         self.tlog("换票成功")  # ticket 不入日志
         return url, match.group(1)
 
-    async def report_reading(self):
+    async def report_reading(self) -> bool:
         """readChapter → newreadadd → addReadTime 三步完整复刻。
 
-        新账号必须先读章节建立阅读记录；每次运行上报 2 分钟，服务端约 10-15 分钟
-        冷却，多次运行累计完成“读听看4分钟”。readChapter 必须 POST（GET 报
-        请求方式不正确，阅读会话不建立，addReadTime 假成功）。
+        新账号必须先读章节建立阅读记录；每次运行上报 2 分钟（服务端有约 3 分钟
+        上报间隔限制），累计满 4 分钟后方可完成“读听看4分钟”。readChapter 必须 POST
+        （GET 报请求方式不正确，阅读会话不建立，addReadTime 假成功）。
         """
         r = await self.post(
             f"/cnt/readChapter?cntindex={BOOK['cntindex']}"
@@ -202,30 +203,70 @@ class WoreadTask(Task):
         if res := ok(r):
             weektime = (res.get("data") or {}).get("weektime")
             self.tlog(f"阅读上报: +2分钟 (weektime={weektime})")
-        else:
-            self.tlog(
-                f"阅读上报: {api_response_err(r, 'addReadTime')} (冷却中/已满，下次再报)"
-            )
+            return True
+        self.tlog(
+            f"阅读上报: {api_response_err(r, 'addReadTime')} (冷却中/已满，下次再报)"
+        )
+        return False
 
-    async def claim_points(self, jf: JfTaskClient):
+    async def claim_points(self, jf: JfTaskClient, *, tasks=None, sign_task=None):
         """④ 爱听签到 ⑤ 领可完成任务积分 ⑥ 查询今日积分。"""
-        r = await jf.post("uasptask/sign", {"taskCode": JF_SIGN_TASK})
-        if res := ok(r):
-            data = res.get("data") or {}
-            self.tlog(f"签到成功: {data.get('title', '')} (+{data.get('score', '')})")
+        if sign_task is not None and not task_pending(sign_task):
+            self.tlog("今日已签到")
         else:
-            self.tlog(f"签到: {api_response_err(r, 'sign')} (可能已签)")
+            sign_code = (sign_task or {}).get("taskCode") or JF_SIGN_TASK
+            r = await jf.post("uasptask/sign", {"taskCode": sign_code})
+            if res := ok(r):
+                data = res.get("data") or {}
+                self.tlog(
+                    f"签到成功: {data.get('title', '')} (+{data.get('score', '')})"
+                )
+            elif (
+                isinstance(r.get("data"), dict) and str(r["data"].get("code")) == "4005"
+            ):
+                self.tlog("今日已签到")
+            else:
+                self.tlog(f"签到失败: {api_response_err(r, 'sign')}")
+
+        current_tasks = tasks if tasks is not None else await jf.task_list()
+        attempted: list[tuple[dict, int, dict]] = []
+        for t in current_tasks:
+            name = t.get("taskName", "")
+            if (
+                t.get("taskCode") == JF_SIGN_TASK
+                or "签到" in name
+                or any(k in name for k in SKIP_KEYWORDS)
+                or not task_pending(t)
+            ):
+                continue
+            before_finish = safe_int(t.get("finishCount"), 0)
+            r = await jf.post("jftask/toFinish", {"taskCode": t.get("taskCode")})
+            attempted.append((t, before_finish, r))
+            await asyncio.sleep(1)
 
         claimed = 0
-        for t in await jf.task_list():
-            name = t.get("taskName", "")
-            if any(k in name for k in SKIP_KEYWORDS) or not task_pending(t):
-                continue
-            r = await jf.post("jftask/toFinish", {"taskCode": t.get("taskCode")})
-            done = isinstance(r.get("data"), dict) and r["data"].get("data") is True
-            self.tlog(f"领积分 [{name}]: {'成功' if done else '未达条件'}")
-            claimed += done
-            await asyncio.sleep(1)
+        if attempted:
+            # jftask/toFinish 在时长未满 4 分钟时也会返回 data=true，必须读回 finishCount 确认真到账
+            refreshed = await jf.task_list()
+            by_code = {x.get("taskCode"): x for x in refreshed}
+            for t, before_finish, r in attempted:
+                name = t.get("taskName", "")
+                accepted = (
+                    isinstance(r.get("data"), dict) and r["data"].get("data") is True
+                )
+                after = by_code.get(t.get("taskCode"))
+                after_finish = (
+                    safe_int(after.get("finishCount"), 0) if after is not None else 0
+                )
+                done = bool(
+                    after is not None
+                    and (
+                        after_finish > before_finish
+                        or (accepted and not task_pending(after))
+                    )
+                )
+                self.tlog(f"领积分 [{name}]: {'成功' if done else '未达条件'}")
+                claimed += int(done)
 
         if (info := await jf.user_info()) is not None:
             self.tlog(
@@ -255,5 +296,30 @@ class WoreadTask(Task):
         )
         if not await jf.init():
             return
-        await self.report_reading()
-        await self.claim_points(jf)
+        tasks = await jf.task_list()
+        sign_task = next(
+            (
+                t
+                for t in tasks
+                if t.get("taskCode") == JF_SIGN_TASK
+                or "签到" in str(t.get("taskName", ""))
+            ),
+            None,
+        )
+        pending_read = [
+            t
+            for t in tasks
+            if t is not sign_task
+            and t.get("taskCode") != JF_SIGN_TASK
+            and not any(k in str(t.get("taskName", "")) for k in SKIP_KEYWORDS)
+            and task_pending(t)
+        ]
+        if not tasks or pending_read:
+            if await self.report_reading():
+                # 沃阅读上报同步至积分中心存在数秒跨系统延迟，等待落库后再调 toFinish
+                await asyncio.sleep(READ_SYNC_WAIT_SECONDS)
+            if not tasks:
+                tasks = None
+        else:
+            self.tlog("今日阅读积分任务已完成，跳过阅读上报")
+        await self.claim_points(jf, tasks=tasks, sign_task=sign_task)
